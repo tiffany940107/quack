@@ -183,6 +183,112 @@ def test_sm120_mxfp8_varlen_m(seqlens_m):
 
 
 @requires_sm120
+def test_sm120_mxfp8_varlen_m_epilogue_mods():
+    """The epilogue-mod host path must preserve varlen-M's asymmetric SF
+    layout: one tile-padded SFA batch for concatenated rows, but one SFB batch
+    per expert.  Cover both MoE stages that use this path: BF16 identity output
+    and fused SwiGLU + MXFP8 output."""
+    import cutlass
+
+    from quack.blockscaled.quantize import unpack_scale_blocked_to_2d
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from quack.epilogue.library import identity_epi, swiglu_quant_mod
+
+    seqlens_m = [1, 128, 127, 129]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    torch.manual_seed(0)
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts,
+        0,
+        n,
+        k,
+        32,
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        seqlens_m=seqlens_m,
+    )
+    # The helper's kernel-ready layout is (N, K, E).  EpiMod's torch-facing
+    # grouped contract is (E, N, K), with K contiguous.
+    B = qb.permute(2, 0, 1)
+    total_m = sum(seqlens_m)
+    cu = cu_seqlens_m.tolist()
+
+    out = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    identity_epi.gemm(
+        qa,
+        B,
+        out,
+        epi_args={},
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=True,
+        persistent=True,
+        is_dynamic_persistent=True,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+    ref = torch.cat(
+        [a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)]
+    )
+    err = (out.float() - ref).abs().max().item()
+    assert err < 5e-3, f"identity epilogue varlen-M max_err={err}"
+
+    # Reuse the same 2I-wide GEMM as FC1 and quantize its I-wide SwiGLU output.
+    intermediate = n // 2
+    padded_rm = (total_m + 127) // 128 + (num_experts - 1)
+    postact = torch.empty(
+        total_m, intermediate, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    postact_sf = torch.empty(
+        (1, padded_rm, (intermediate + 127) // 128, 32, 4, 4),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    swiglu_quant_mod.gemm(
+        qa,
+        B,
+        None,
+        epi_args={"postact": postact, "postact_sf": postact_sf},
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=True,
+        persistent=True,
+        is_dynamic_persistent=True,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+
+    post_ref = F.silu(ref[:, 0::2]) * ref[:, 1::2]
+    padded_sf = unpack_scale_blocked_to_2d(
+        postact_sf, padded_rm * 128, intermediate // 32
+    )[0]
+    active_sf = torch.cat(
+        [
+            padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
+            for i in range(num_experts)
+        ]
+    )
+    dequant = postact.float() * active_sf.float().repeat_interleave(32, dim=-1)
+    # E4M3 rounding error is bounded by half a quantization bin.  The widest
+    # finite E4M3 bin is 32, hence a conservative 16 * scale bound.
+    bound = active_sf.float().repeat_interleave(32, dim=-1) * (16.0 * 1.05) + 1e-2
+    assert ((dequant - post_ref).abs() <= bound).all(), (
+        f"SwiGLU quant epilogue max_err={(dequant - post_ref).abs().max().item()}"
+    )
+
+
+@requires_sm120
 def test_sm120_mxfp8_vs_cublas():
     """Bit-exact comparison against torch._scaled_mm (cuBLAS MXFP8 path).
     Both consume the same fp8 values and e8m0 scales with f32 accumulation, so

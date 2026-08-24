@@ -774,8 +774,12 @@ class EpiMod:
                 )
             return plan
         if blockscaled:
-            if varlen_m or gather_A:
-                raise ValueError("blockscaled GEMM does not support varlen/gather yet")
+            # The SM100/SM120 mainloops already support a tile-padded SFA for
+            # varlen_m (the same layout used by gemm_interface.gemm).  Keep
+            # gather_A disabled: block-scaled gather needs a scale lookup for
+            # every gathered row and that contract has not been implemented.
+            if gather_A:
+                raise ValueError("blockscaled GEMM does not support gather_A yet")
             if concat_key:
                 raise ValueError("blockscaled GEMM does not support concat_layout")
             if tile_K is not None:
@@ -1044,7 +1048,15 @@ class EpiMod:
             a_mma_dtype = fmt_a.to_cutlass_dtype()
             b_mma_dtype = fmt_b.to_cutlass_dtype()
             sf_dtype, sf_vec_size = validate_blockscaled_sf(
-                A, B, SFA, SFB, device_capacity, b_kn=b_kn, fmt_a=fmt_a, fmt_b=fmt_b
+                A,
+                B,
+                SFA,
+                SFB,
+                device_capacity,
+                num_batches=(cu_seqlens_m.shape[0] - 1) if varlen_m else None,
+                b_kn=b_kn,
+                fmt_a=fmt_a,
+                fmt_b=fmt_b,
             )
         # Re-map pinned ops' kind for the device loop: explicit pins still
         # need a fragment kind; VecLoads present as their dim.
