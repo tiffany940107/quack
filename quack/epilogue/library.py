@@ -46,6 +46,7 @@ from quack.epilogue.ops import (
     ColVecLoad,
     ColVecReduce,
     ColVecSelect,
+    IndexedRowAtomicAdd,
     OnlineLSEReduce,
     RowVecLoad,
     RowVecReduce,
@@ -251,6 +252,24 @@ def identity_epi(acc):
     N'-major (both views, no copies) and the epilogue writes the f32
     accumulator directly (bf16 matmuls can't emit fp32 through torch)."""
     return {"D": acc}
+
+
+_weighted_recv_token = ColVecLoad("recv_token")
+
+
+@gemm_epilogue(
+    ops={"score": ColVecLoad("score")},
+    outs={
+        "reduced": IndexedRowAtomicAdd(
+            "reduced", idx_op=_weighted_recv_token
+        )
+    },
+    extra_ops=(_weighted_recv_token,),
+)
+def weighted_scatter_epi(acc, score):
+    """D-less FC2 epilogue: router-score multiply and FP32 indexed reduce."""
+
+    return {"reduced": acc * score}
 
 
 @gemm_epilogue()

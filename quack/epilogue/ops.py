@@ -23,7 +23,7 @@ from typing import NamedTuple, Optional
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as blackwell_helpers
-from cutlass import Boolean, Float32, Int32, Uint32, const_expr
+from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr
 from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -2832,6 +2832,111 @@ def _selp_pair_f16x2(
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+class IndexedRowAtomicAdd(EpiOp):
+    """D-less FP32 atomic scatter sink indexed by a companion col vector."""
+
+    fn_port = "sink"
+
+    def __init__(self, name, idx_op):
+        super().__init__(name)
+        if not isinstance(idx_op, ColVecLoad):
+            raise ValueError("IndexedRowAtomicAdd requires a ColVecLoad index companion")
+        self.idx_op = idx_op
+
+    def config_key(self):
+        return (self.idx_op.cache_key(),)
+
+    def host_fake_arg(self, key, fctx):
+        dtype, ndim = key
+        if ndim != 2:
+            raise ValueError("IndexedRowAtomicAdd output must be rank two")
+        return make_fake_tensor(
+            dtype, (cute.sym_int(), fctx.n), leading_dim=1, divisibility=1
+        )
+
+    def host_validate(self, value, *, m, n, tile_M, tile_N, batch, varlen_m, epi_args):
+        idx = epi_args.get(self.idx_op.name)
+        if idx is None:
+            raise ValueError(
+                f"sink '{self.name}' requires the '{self.idx_op.name}' index operand"
+            )
+        if idx.dtype not in (torch.int32, torch.int64) or idx.shape != (m,):
+            raise ValueError(
+                f"'{self.idx_op.name}' must be int32/int64 with shape ({m},)"
+            )
+        if (
+            value.ndim != 2
+            or value.shape[1] != n
+            or value.dtype != torch.float32
+            or not value.is_contiguous()
+        ):
+            raise ValueError(
+                f"sink '{self.name}' must be contiguous FP32 (destination_rows, {n})"
+            )
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        return getattr(storage_epi, f"s_{self.idx_op.name}").get_tensor(
+            cute.make_layout(gemm.cta_tile_shape_mnk[0])
+        )
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        ref_layout = cute.make_layout((ctx.tile_M, ctx.tile_N), stride=(1, 0))
+        tDrRef = ctx.partition_for_epilogue_fn(
+            cute.make_rmem_tensor(ref_layout, Float32)
+        )
+        tDcD = ctx.partition_for_epilogue_fn(
+            cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+        )
+        limit_m = min(
+            ctx.varlen_manager.len_m(ctx.batch_idx)
+            - ctx.tile_coord_mnkl[0] * ctx.tile_M,
+            ctx.tile_M,
+        )
+        limit_n = min(
+            ctx.varlen_manager.len_n() - ctx.tile_coord_mnkl[1] * ctx.tile_N,
+            ctx.tile_N,
+        )
+        n_off = ctx.tile_coord_mnkl[1] * ctx.tile_N
+        return (smem_tensor, tDrRef, tDcD, param, limit_m, limit_n, n_off)
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        ref = state[1][None, None, None, epi_coord[0], epi_coord[1]]
+        coords = state[2][None, None, None, epi_coord[0], epi_coord[1]]
+        return (state[0], ref, coords, *state[3:])
+
+    @cute.jit
+    def fn_sink_flush(self, gemm, state, frag):
+        s_idx, ref, coords, output, limit_m, limit_n, n_off = state
+        frag_mn = layout_utils.convert_layout_zero_stride(frag, ref.layout)
+        coords_mn = layout_utils.convert_layout_zero_stride(coords, ref.layout)
+        rows = const_expr(cute.size(frag_mn, mode=[0]))
+        columns = const_expr(cute.size(frag_mn, mode=[1]))
+        for row_slot in cutlass.range_constexpr(rows):
+            row = coords_mn[row_slot, 0][0]
+            destination = Int64(s_idx[row])
+            valid_row = (row < limit_m) & (destination >= 0) & (
+                destination < output.shape[0]
+            )
+            for col_slot in cutlass.range_constexpr(columns):
+                column = coords_mn[row_slot, col_slot][1]
+                if valid_row & (column < limit_n):
+                    offset = (
+                        destination * Int64(output.stride[0])
+                        + Int64(column + n_off) * Int64(output.stride[1])
+                    )
+                    cute.arch.atomic_add(
+                        output.iterator + offset, frag_mn[row_slot, col_slot]
+                    )
 
 
 class ColVecSelect(EpiOp):

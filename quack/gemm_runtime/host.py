@@ -116,6 +116,7 @@ def _compile_gemm_epi(
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
+    has_batch_idx_permute=False,
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
     # A-operand transform (SM90 RS / SM120 warp-MMA mainloop,
@@ -211,7 +212,10 @@ def _compile_gemm_epi(
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
+        (is_dynamic_persistent and device_capacity[0] == 9),
+        has_batch_idx_permute,
+        l,
+        has_ag=has_ag,
     )
     varlen_args = make_fake_varlen_args(
         varlen_m,
@@ -353,6 +357,7 @@ def build_gemm_epi_plan(
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
     has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
+    has_batch_idx_permute=False,
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
     # A-operand transform handle (format name / DecodeFormat / a_transform
@@ -460,6 +465,7 @@ def build_gemm_epi_plan(
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
         has_ag=has_ag,
+        has_batch_idx_permute=has_batch_idx_permute,
         split_k=split_k,
         split_k_mode=split_k_mode,
         transform_a_ref=transform_ref,
@@ -474,7 +480,7 @@ def build_gemm_epi_plan(
     # iteration), never the prebuilt static tuple.
     scheduler_static = (
         make_scheduler_args(max_active_clusters, max_swizzle_size, None)
-        if not scheduler_uses_semaphore and not has_ag
+        if not scheduler_uses_semaphore and not has_ag and not has_batch_idx_permute
         else None
     )
     plan_ops = _ops_by_name(GemmCls)
@@ -524,6 +530,7 @@ def run_gemm_epi_plan(
     *,
     ag_args=None,  # forwarded to the scheduler (AllGather+GEMM flags contract)
     tile_count_semaphore=None,
+    batch_idx_permute=None,
     cu_seqlens_m=None,
     cu_seqlens_k=None,
     A_idx=None,
@@ -567,7 +574,13 @@ def run_gemm_epi_plan(
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
+    scheduler_args = plan_scheduler_args(
+        plan,
+        tile_count_semaphore,
+        batch_idx_permute,
+        ag_args=ag_args,
+        A=A,
+    )
     cu_tiles_m = (
         compute_cu_tiles_m(cu_seqlens_m, plan.cu_tiles_tile_m)
         if cu_seqlens_m is not None and plan.cu_tiles_tile_m is not None

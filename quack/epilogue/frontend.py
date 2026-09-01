@@ -581,6 +581,7 @@ class EpiMod:
         max_swizzle_size: int = 8,
         tile_count_semaphore=None,
         cu_seqlens_m=None,
+        batch_idx_permute=None,
         A_idx=None,
         rounding_mode: int = RoundingMode.RN,
         epi_key_overrides=None,  # {op_name: key} when the caller owns the key rule (scalar modes)
@@ -656,6 +657,13 @@ class EpiMod:
             A_slot, B_slot = (B, A) if swap_ab else (A, B)
         if tile_count_semaphore is not None and not is_dynamic_persistent:
             raise ValueError("tile_count_semaphore requires is_dynamic_persistent=True")
+        if batch_idx_permute is not None:
+            import torch
+
+            if batch_idx_permute.dtype != torch.int32 or batch_idx_permute.ndim != 1:
+                raise ValueError("batch_idx_permute must be a one-dimensional int32 tensor")
+            if batch_idx_permute.device != A.device:
+                raise ValueError("batch_idx_permute must be on the GEMM device")
         if add_to_output:
             import torch
 
@@ -718,6 +726,7 @@ class EpiMod:
             max_swizzle_size,
             A.device,
             tensor_key(cu_seqlens_m),
+            tensor_key(batch_idx_permute),
             gather_A,
             rounding_mode,
             b_kn,
@@ -767,6 +776,7 @@ class EpiMod:
                     ag_args=ag_args,
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
+                    batch_idx_permute=batch_idx_permute,
                     A_idx=A_idx,
                     SFA=SFA,
                     SFB=SFB,
@@ -788,6 +798,10 @@ class EpiMod:
             if not persistent:
                 raise ValueError("varlen_m requires persistent=True")
             num_seqs = cu_seqlens_m.shape[0] - 1
+            if batch_idx_permute is not None and batch_idx_permute.shape != (num_seqs,):
+                raise ValueError(
+                    "batch_idx_permute length must equal the number of varlen sequences"
+                )
             if B.ndim != 3 or B.shape[0] != num_seqs:
                 raise ValueError(
                     f"varlen_m B is per-sequence indexed: expected (num_seqs={num_seqs}, "
@@ -839,10 +853,13 @@ class EpiMod:
         if varlen_m:
             # total_m for operand inference (colvec length); A rows differ
             # under gather_A, so prefer an output's leading extent.
-            ref_t = D if D is not None else epi_args.get((self.outputs or (None,))[0])
-            if ref_t is None:
-                raise ValueError("varlen_m needs D or an aux output")
-            m = ref_t.shape[0]
+            if not gather_A:
+                m = A.shape[0]
+            else:
+                ref_t = D if D is not None else epi_args.get((self.outputs or (None,))[0])
+                if ref_t is None:
+                    raise ValueError("varlen_m gather needs D or an aux output")
+                m = ref_t.shape[0]
         else:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
@@ -1130,6 +1147,7 @@ class EpiMod:
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
             has_ag=ag_args is not None,
+            has_batch_idx_permute=batch_idx_permute is not None,
             split_k=split_k,
             split_k_mode=split_k_mode,
         )
@@ -1145,6 +1163,7 @@ class EpiMod:
                 ag_args=ag_args,
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
+                batch_idx_permute=batch_idx_permute,
                 A_idx=A_idx,
                 SFA=SFA,
                 SFB=SFB,
