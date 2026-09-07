@@ -53,6 +53,8 @@ from quack.softmax_jax import softmax
 ## Documentations
 
 - [JAX interface](docs/jax.md) — optional `jax` + `jax-tvm-ffi` bindings, see `quack/softmax_jax.py` for an example.
+- [SM100 MXFP8 variable-length training](docs/sm100_mxfp8_training.md) — expert-boundary
+  scale layouts and fused gated epilogues.
 
 [2025-07-10] We have a comprehensive
 [blogpost](media/2025-07-10-membound-sol.md) on how to get memory-bound kernels
