@@ -220,8 +220,14 @@ def _compile_gemm_epi(
         m if varlen_m else None,
         has_cu_tiles_m=varlen_m and _has_m_fold_sink(ops, epi_keys),
     )
-    mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
-    mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
+    if sf_dtype:
+        # Varlen-M concatenates A rows but pads each sequence's scale rows to
+        # a 128-row atom: SFA has one physical batch, while SFB stays batched.
+        dense_l = l if sf_batched else None
+        mSFA = make_fake_sf_tensor(sf_dtype, 1 if varlen_m else dense_l)
+        mSFB = make_fake_sf_tensor(sf_dtype, dense_l)
+    else:
+        mSFA, mSFB = None, None
     post_init = None
     if post_init_attrs:
 
