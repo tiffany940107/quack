@@ -625,6 +625,90 @@ def test_quant_postact_gated_exact():
     torch.testing.assert_close(postact[0].float(), q_ref, rtol=0, atol=0)
 
 
+def test_quant_postact_gated_rowvec_exact():
+    """Inference FC1 fuses expert bias without allocating a preactivation."""
+    skip_unsupported(aux=True)
+    from quack.epilogue.library import gated_quant_mod
+
+    torch.manual_seed(1)
+    batch, m, n, k = 1, 256, 512, 128
+    n_post = n // 2
+    a = torch.randn(batch, m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(batch, n, k, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(batch, n, dtype=torch.bfloat16, device="cuda")
+    postact = torch.empty(batch, m, n_post, dtype=torch.float8_e4m3fn, device="cuda")
+    sf = torch.empty(
+        batch,
+        ceil_div(m, 128),
+        ceil_div(n_post, 128),
+        32,
+        4,
+        4,
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    gated_quant_mod("reglu", has_rowvec=True).gemm(
+        a,
+        b,
+        None,
+        epi_args=dict(postact=postact, postact_sf=sf, mRowVecBroadcast=bias),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    preact_ref = torch.einsum("lmk,lnk->lmn", a.float(), b.float()) + bias.float()[:, None]
+    post_ref = (preact_ref[..., 0::2].relu() * preact_ref[..., 1::2])[0]
+    q_ref, sf_ref, _ = quant_ref(post_ref, "mxfp8_e4m3")
+    sf_2d = unpack_scale_blocked_to_2d(sf, m, n_post // 32)[0]
+    assert torch.equal(sf_2d.view(torch.uint8), sf_ref)
+    torch.testing.assert_close(postact[0].float(), q_ref, rtol=0, atol=0)
+
+
+def test_quant_postact_gated_store_preact_exact():
+    """The training FC1 epilogue stores the BF16 preactivation while it
+    quantizes the gated postactivation.  ReGLU keeps the reference arithmetic
+    exact enough to pin both the scale bytes and FP8 values."""
+    skip_unsupported(aux=True)
+    from quack.epilogue.library import gated_preact_quant_mod
+
+    torch.manual_seed(0)
+    l, m, N, k = 1, 256, 512, 128
+    n_post = N // 2
+    A = torch.randn(l, m, k, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(l, N, k, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(l, N, dtype=torch.bfloat16, device="cuda")
+    preact = torch.empty(l, m, N, dtype=torch.bfloat16, device="cuda")
+    postact = torch.empty(l, m, n_post, dtype=torch.float8_e4m3fn, device="cuda")
+    sf = torch.empty(
+        l,
+        ceil_div(m, 128),
+        ceil_div(n_post, 128),
+        32,
+        4,
+        4,
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    gated_preact_quant_mod("reglu", has_rowvec=True).gemm(
+        A,
+        B,
+        preact,
+        epi_args=dict(postact=postact, postact_sf=sf, mRowVecBroadcast=bias),
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+    )
+    preact_ref = torch.einsum("lmk,lnk->lmn", A.float(), B.float()) + bias.float()[:, None]
+    torch.testing.assert_close(preact.float(), preact_ref, rtol=5e-3, atol=2e-1)
+    post_ref = (preact_ref[..., 0::2].relu() * preact_ref[..., 1::2])[0]
+    q_ref, sf_ref, _ = quant_ref(post_ref, "mxfp8_e4m3")
+    sf_2d = unpack_scale_blocked_to_2d(sf, m, n_post // 32)[0]
+    assert torch.equal(sf_2d.view(torch.uint8), sf_ref)
+    torch.testing.assert_close(postact[0].float(), q_ref, rtol=0, atol=0)
+
+
 def test_quant_postact_nvfp4_norm_const():
     """nvfp4 postact with the per-tensor second level folded via sfd_norm_const."""
     skip_unsupported("nvfp4", aux=True)

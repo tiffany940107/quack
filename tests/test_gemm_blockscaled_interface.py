@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.blockscaled.quantize import nvfp4_per_tensor_scale
+from quack.blockscaled.quantize import nvfp4_per_tensor_scale, unpack_scale_blocked_to_2d
 from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from quack.blockscaled.utils import blockscaled_quantize_dim0
@@ -192,6 +192,80 @@ def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
     ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
     err = (out.float() - ref).abs().max().item()
     assert err < 5e-3, f"varlen_m {fmt} seqlens_m={seqlens_m} max_err={err}"
+
+
+def test_blockscaled_gemm_varlen_m_gated_quant_store_preact():
+    """MXFP8 grouped FC1 training: variable-M blockscaled GEMM stores the
+    BF16 preactivation and emits a directly consumable MXFP8 SwiGLU output.
+    Scale atoms are padded independently at every expert boundary."""
+    _skip_if_not_sm100()
+    import cutlass
+
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from quack.epilogue.library import gated_preact_quant_mod
+
+    seqlens_m = [1, 128, 127, 129]
+    num_experts = len(seqlens_m)
+    n, k = 512, 256
+    intermediate = n // 2
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts,
+        0,
+        n,
+        k,
+        32,
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        seqlens_m=seqlens_m,
+    )
+    B = qb.permute(2, 0, 1)
+    total_m = sum(seqlens_m)
+    padded_rm = (total_m + 127) // 128 + num_experts - 1
+    preact = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    postact = torch.empty(total_m, intermediate, dtype=torch.float8_e4m3fn, device="cuda")
+    postact_sf = torch.empty(
+        (1, padded_rm, (intermediate + 127) // 128, 32, 4, 4),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    gated_preact_quant_mod("swiglu").gemm(
+        qa,
+        B,
+        preact,
+        epi_args={"postact": postact, "postact_sf": postact_sf},
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=True,
+        persistent=True,
+        is_dynamic_persistent=True,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+
+    cu = cu_seqlens_m.tolist()
+    preact_ref = torch.cat(
+        [a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)]
+    )
+    assert _rel_err(preact, preact_ref) < 5e-3
+    postact_ref = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
+    padded_sf = unpack_scale_blocked_to_2d(
+        postact_sf, padded_rm * 128, intermediate // 32
+    )[0]
+    active_sf = torch.cat(
+        [
+            padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
+            for i in range(num_experts)
+        ]
+    ).float()
+    scale = active_sf.repeat_interleave(32, dim=-1)
+    dequant = postact.float() * scale
+    bound = scale * (16.0 * 1.05) + 1e-2
+    assert ((dequant - postact_ref).abs() <= bound).all()
 
 
 @pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [96, 160, 128], [100, 220, 65]])

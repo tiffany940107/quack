@@ -202,7 +202,7 @@ def swiglu_mod(acc):
 
 
 @functools.lru_cache(maxsize=None)
-def gated_quant_mod(activation):
+def gated_quant_mod(activation, *, has_rowvec=False):
     """gemm + gated activation + QUANTIZED postact (the MoE FC1 fusion):
     ``postact`` is fp8 e4m3 or packed fp4 values (its dtype picks
     mxfp8/mxfp4/nvfp4 together with the SF dtype), ``postact_sf`` the blocked
@@ -213,25 +213,84 @@ def gated_quant_mod(activation):
     columns — see BlockScaleFactorStore(output=...)."""
     act = gate_fn_map[activation]
 
-    @gemm_epilogue(
-        outputs=(
-            TileStore(
-                "postact",
-                gated=True,
-                quant=BlockScaleFactorStore("postact_sf", output="postact"),
-            ),
+    outputs = (
+        TileStore(
+            "postact",
+            gated=True,
+            quant=BlockScaleFactorStore("postact_sf", output="postact"),
         ),
-        extra_ops=(Scalar("sfd_norm_const"),),
-        mode="acc_pair",
     )
-    def gated_quant_epi(acc):
-        gate, up = unpack(acc)
-        return {"postact": act(gate, up)}
+
+    if has_rowvec:
+
+        @gemm_epilogue(
+            outputs=outputs,
+            ops={"mRowVecBroadcast": RowVecLoad("mRowVecBroadcast")},
+            extra_ops=(Scalar("sfd_norm_const"),),
+            mode="acc_pair",
+        )
+        def gated_quant_epi(acc, mRowVecBroadcast):
+            gate, up = unpack(acc + mRowVecBroadcast)
+            return {"postact": act(gate, up)}
+
+    else:
+
+        @gemm_epilogue(
+            outputs=outputs,
+            extra_ops=(Scalar("sfd_norm_const"),),
+            mode="acc_pair",
+        )
+        def gated_quant_epi(acc):
+            gate, up = unpack(acc)
+            return {"postact": act(gate, up)}
 
     return gated_quant_epi
 
 
 swiglu_quant_mod = gated_quant_mod("swiglu")
+
+
+@functools.lru_cache(maxsize=None)
+def gated_preact_quant_mod(activation, *, has_rowvec=False):
+    """Training form of :func:`gated_quant_mod`.
+
+    The accumulator is stored as the high-precision preactivation ``D`` while
+    the gated activation is quantized into ``postact`` / ``postact_sf``.  This
+    lets an MoE training caller retain exactly the tensor needed by gated
+    backward without materializing a BF16 postactivation before FC2.
+    """
+    act = gate_fn_map[activation]
+
+    outputs = (
+        TileStore(
+            "postact",
+            gated=True,
+            quant=BlockScaleFactorStore("postact_sf", output="postact"),
+        ),
+    )
+    if has_rowvec:
+
+        @gemm_epilogue(
+            outputs=outputs,
+            ops={"mRowVecBroadcast": RowVecLoad("mRowVecBroadcast")},
+            mode="acc_pair",
+        )
+        def gated_preact_quant_epi(acc, mRowVecBroadcast):
+            value = acc + mRowVecBroadcast
+            gate, up = unpack(value)
+            return {"D": pack(gate, up), "postact": act(gate, up)}
+
+    else:
+
+        @gemm_epilogue(outputs=outputs, mode="acc_pair")
+        def gated_preact_quant_epi(acc):
+            gate, up = unpack(acc)
+            return {"D": pack(gate, up), "postact": act(gate, up)}
+
+    return gated_preact_quant_epi
+
+
+swiglu_preact_quant_mod = gated_preact_quant_mod("swiglu")
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
