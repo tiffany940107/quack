@@ -821,18 +821,37 @@ class TileStore(EpiOp):
             the EpiMod frontend lifts it into the op set (extra_ops), and the
             driver runs it on the final fragment right before store_convert
             (see gemm_base.epilogue and ComposableEpiMixin._epi_store_quant).
+        packed_dtype: optional logical 8-bit dtype for a two-lane packed
+            output. The public tensor remains ``(..., 2 * GEMM_N)`` in this
+            dtype, while the trace recasts it to ``(..., GEMM_N)`` Int16 so
+            the ordinary one-column-per-accumulator TMA path stores each
+            adjacent pair as one word. This is used by packed_cd dgated mods,
+            where one accumulator produces ``(dx, dy)``. Quantization still
+            sees the two logical fp32 lanes before they are packed.
     """
 
     def __init__(
-        self, name, epi_tile_fn=None, gated=False, rounding=None, store_pred_fn=None, quant=None
+        self,
+        name,
+        epi_tile_fn=None,
+        gated=False,
+        rounding=None,
+        store_pred_fn=None,
+        quant=None,
+        packed_dtype=None,
     ):
         super().__init__(name)
+        if packed_dtype is not None:
+            assert packed_dtype.width == 8, "packed TileStore currently supports 2 x 8-bit lanes"
+            assert not gated, "packed and gated TileStore shapes are mutually exclusive"
+            assert epi_tile_fn is None, "packed TileStore owns its physical pair-space shape"
         if gated and epi_tile_fn is None:
             epi_tile_fn = _gated_epi_tile_fn
         self.epi_tile_fn = epi_tile_fn
         self.gated = gated
         self.rounding = rounding
         self.store_pred_fn = store_pred_fn
+        self.packed_dtype = packed_dtype
         if quant is not None:
             assert getattr(quant, "quant_output", None) == name, (
                 f"quantize codec for output {name!r} must declare output={name!r}"
@@ -846,6 +865,7 @@ class TileStore(EpiOp):
             self.rounding,
             _callable_config_key(self.store_pred_fn),
             self.quant.cache_key() if self.quant is not None else None,
+            self.packed_dtype,
         )
 
     def is_tile_store(self):
@@ -886,7 +906,7 @@ class TileStore(EpiOp):
         # n-major by construction (asserted in to_params). Sub-byte (fp4)
         # tiles also need a fresh sym: their packed contiguous extent must be
         # statically divisible (the FFI packing check).
-        if self.epi_tile_fn is not None or dtype.width < 8:
+        if self.epi_tile_fn is not None or dtype.width < 8 or self.packed_dtype is not None:
             n = cute.sym_int(divisibility=div_for_dtype(dtype))
         else:
             n = fctx.n
@@ -913,6 +933,10 @@ class TileStore(EpiOp):
 
     def to_params(self, gemm, args):
         tensor = getattr(args, self.name)
+        if self.packed_dtype is not None:
+            assert tensor.element_type is cutlass.Int16, (
+                f"packed TileStore tensor must be trace-recast to Int16, got {tensor.element_type}"
+            )
         layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
         if self.gated:
             # The smem store path degrades to a universal SIMT copy for
@@ -951,7 +975,12 @@ class TileStore(EpiOp):
         # fixup path), so extract the int shape first.
         return EpiSmemBytes(
             # multiply before dividing: sub-byte dtypes (fp4) would floor to 0
-            d_stage=cute.size(cute.shape(epi_tile)) * arg_tensor.element_type.width // 8
+            # Packed outputs expose two logical fp8 values per physical
+            # accumulator column / Int16 smem element.
+            d_stage=cute.size(cute.shape(epi_tile))
+            * arg_tensor.element_type.width
+            * (2 if self.packed_dtype is not None else 1)
+            // 8
         )
 
     def smem_struct_field(self, gemm, params):
@@ -1102,6 +1131,15 @@ class TileStore(EpiOp):
     ):
         """Convert one subtile's values from acc_dtype to this op's storage
         dtype (per-op rounding), plus the gated STSM register permute."""
+        if const_expr(self.packed_dtype is not None):
+            # The packed_cd visit returns the logical [dx0, dy0, dx1, dy1,
+            # ...] fragment. Quantization has already rescaled these fp32
+            # values. Convert lane-wise, then bitcast adjacent fp8 bytes to
+            # the Int16 physical fragment consumed by the normal store copy.
+            assert self.rounding in (None, RoundingMode.RN), (
+                "packed quantized stores currently support round-to-nearest"
+            )
+            return cute.recast_tensor(tRS_rAuxOut.to(self.packed_dtype), cutlass.Int16)
         dtype = getattr(gemm, self._dtype_gemm_attr())
         rounding = self.rounding if self.rounding is not None else gemm.rounding_mode
         if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width < 16):

@@ -346,6 +346,11 @@ class EpiMod:
         self.mode = "element" if mode is None else mode
         if self.mode not in _EPI_MODES:
             raise ValueError(f"unsupported epilogue mode {self.mode!r}; choose one of {_EPI_MODES}")
+        packed_outputs = [op.name for op in self.output_ops.values() if op.packed_dtype is not None]
+        if packed_outputs and self.mode != "packed_cd_b16x2":
+            raise ValueError(
+                f"packed TileStore outputs {packed_outputs} require mode='packed_cd_b16x2'"
+            )
         self.paired = ("acc",) if self.mode == "acc_pair" else ()
         # None = vectorize the fn loop where supported (SM100). False = keep
         # the vectorizer off for this epilogue: escape hatch for the DSL
@@ -884,6 +889,23 @@ class EpiMod:
 
             aux = epi_args[out_name]
             out_n = n_gemm // 2 if paired_acc else n_gemm
+            store = self.output_ops.get(out_name)
+            if store is not None and store.packed_dtype is not None:
+                if torch2cute_dtype_map.get(aux.dtype) is not store.packed_dtype:
+                    raise TypeError(
+                        f"{out_name} must have packed logical dtype {store.packed_dtype}, "
+                        f"got {aux.dtype}"
+                    )
+                if aux.stride(-1) != 1 or aux.storage_offset() % 2:
+                    raise ValueError(
+                        f"packed auxiliary output {out_name} must be contiguous along N "
+                        "and 2-byte aligned"
+                    )
+                if any(s % 2 for s in aux.stride()[:-1]):
+                    raise ValueError(
+                        f"packed auxiliary output {out_name} outer strides must be even"
+                    )
+                out_n *= 2
             if aux.dtype == torch.float4_e2m1fn_x2:
                 out_n //= 2  # fp4 values are stored packed, two per byte
             _require_shape(out_name, aux, _tile_shape(batch, m, out_n, varlen_m))
@@ -1195,7 +1217,9 @@ class EpiMod:
         n_store = n // 2 if self.mode == "acc_pair" else n
         for name in self.outputs:
             if out.get(name) is None:
-                out[name] = torch.empty((*lead, n_store), dtype=dt, device=A.device)
+                store = self.output_ops.get(name)
+                pack_factor = 2 if store is not None and store.packed_dtype is not None else 1
+                out[name] = torch.empty((*lead, n_store * pack_factor), dtype=dt, device=A.device)
         return out
 
     def _alloc_sinks(self, epi_args, lead, n, config, device, blockscaled=False, num_seqs=None):

@@ -77,8 +77,8 @@ def active_row_sfd_reqs(epi_ops, epilogue_args):
             mult = 2 if store.gated else 1
             aux_width = getattr(epilogue_args, op.quant_output).element_type.width
             min_vals = max(vec, 128 // aux_width)
-        vec_acc = max(vec_acc, vec * mult)
-        epi_n_min = max(epi_n_min, min_vals * mult)
+        vec_acc = max(vec_acc, vec * mult // op.pack_factor)
+        epi_n_min = max(epi_n_min, min_vals * mult // op.pack_factor)
     return vec_acc, epi_n_min
 
 
@@ -167,7 +167,7 @@ class BlockScaleFactorStore(EpiOp):
     either fully inside or fully outside the padded SF extent.
     """
 
-    def __init__(self, name, direction="row", output="D"):
+    def __init__(self, name, direction="row", output="D", pack_factor=1):
         """direction selects the SF vector orientation: "row" = vec contiguous
         elements along N (output feeds the next GEMM's K = this N), "col" =
         vec contiguous elements along M (for backward, where the consumer
@@ -196,11 +196,14 @@ class BlockScaleFactorStore(EpiOp):
         super().__init__(name)
         assert direction in ("row", "col")
         assert output == "D" or direction == "row", "aux quantization is row-direction only"
+        assert pack_factor in (1, 2), "output quantization supports scalar or fp8x2 fragments"
+        assert pack_factor == 1 or output != "D", "packed quantization is auxiliary-output only"
         self.direction = direction
         self.quant_output = output
+        self.pack_factor = pack_factor
 
     def config_key(self):
-        return (self.direction, self.quant_output)
+        return (self.direction, self.quant_output, self.pack_factor)
 
     def _col_redux_path(self, arch):
         """Whether the col direction takes SM100's dedicated implementation
@@ -234,6 +237,9 @@ class BlockScaleFactorStore(EpiOp):
     def _acc_mult_attr(self):
         return f"_sf_acc_mult_{self.name}"
 
+    def _pack_factor_attr(self):
+        return f"_sf_pack_factor_{self.name}"
+
     def to_params(self, gemm, args):
         mSFD = getattr(args, self.name)
         # The optional fp32 norm constant (reciprocal of the nvfp4 per-tensor
@@ -256,9 +262,19 @@ class BlockScaleFactorStore(EpiOp):
                 op for op in gemm._epi_ops if op.is_tile_store() and op.name == self.quant_output
             )
             acc_mult = 2 if store.gated else 1
-            assert not getattr(gemm, "_epi_mod_packed_cd", False), (
-                "aux quantization does not support packed_cd mods"
-            )
+            if self.pack_factor == 2:
+                assert getattr(gemm, "_epi_mod_packed_cd", False), (
+                    "packed auxiliary quantization requires a packed_cd mod"
+                )
+                assert store.packed_dtype is not None, (
+                    "packed auxiliary quantization requires a packed TileStore"
+                )
+                val_dtype = store.packed_dtype
+            else:
+                assert store.packed_dtype is None
+                assert not getattr(gemm, "_epi_mod_packed_cd", False), (
+                    "scalar aux quantization does not support packed_cd mods"
+                )
         # Both directions and aux-output (postact) quantization run on the
         # SM100 tmem epilogue and the SM90-style register epilogue (SM120
         # warp MMA).
@@ -286,7 +302,8 @@ class BlockScaleFactorStore(EpiOp):
         # The op works entirely in accumulator-N space: identity for D, and
         # acc_mult * vec consecutive acc columns per SF vector for a gated
         # aux target (postact interleaves gate/up at pair granularity).
-        vec_acc = vec * acc_mult
+        assert (vec * acc_mult) % self.pack_factor == 0
+        vec_acc = vec * acc_mult // self.pack_factor
         assert gemm.cta_tile_shape_mnk[1] % vec_acc == 0
         epi_tile_n = gemm.epi_tile[1]
         # Each SF vector must be produced within a single epilogue subtile: the
@@ -305,6 +322,7 @@ class BlockScaleFactorStore(EpiOp):
         setattr(gemm, self._sf_dtype_attr(), sf_dtype)
         setattr(gemm, self._val_dtype_attr(), val_dtype)
         setattr(gemm, self._acc_mult_attr(), acc_mult)
+        setattr(gemm, self._pack_factor_attr(), self.pack_factor)
         # (L, rm, rk, 32, 4, 4) blocked scale tensor -> logical (M_pad, N_pad, L)
         # view with the hardware 128x4 SF atom and stride-0 intra-vector mode
         # (N_pad in ACC columns: rk * 4 slots * vec_acc — the 512 B atom is
@@ -405,7 +423,11 @@ class BlockScaleFactorStore(EpiOp):
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
         # Budget conservatively for an aux target: gated-ness is unknown here,
         # assume the doubled acc-space vector.
-        vec_eff = sf_vec_size_for(arg_tensor.element_type) * (1 if self.quant_output == "D" else 2)
+        vec_eff = (
+            sf_vec_size_for(arg_tensor.element_type)
+            * (1 if self.quant_output == "D" else 2)
+            // self.pack_factor
+        )
         if not self._xwarp_smem_needed(vec_eff, warp_shape_mnk):
             return EpiSmemBytes()
         return EpiSmemBytes(
@@ -712,6 +734,7 @@ class BlockScaleFactorStore(EpiOp):
                 norm_const=loop_state.norm_const,
                 value_dtype=value_dtype,
                 acc_stride=getattr(gemm, self._acc_mult_attr()),
+                pack_factor=getattr(gemm, self._pack_factor_attr()),
                 xwarp=loop_state.xwarp,
             )
 
@@ -843,6 +866,7 @@ def sfd_quantize_subtile(
     norm_const=None,
     value_dtype=None,
     acc_stride=1,
+    pack_factor=1,
     xwarp=None,
 ):
     """Compute + quantize SF for one subtile and rescale tRS_rD in place.
@@ -854,6 +878,12 @@ def sfd_quantize_subtile(
     The SF slot tensors live in accumulator space. ``acc_stride`` maps
     fragment element i to acc element acc_stride * i: 1 for full-tile values,
     2 for a halved gated postact whose element i is act(acc[2i], acc[2i+1]).
+
+    ``pack_factor=2`` handles a packed_cd auxiliary output: each accumulator
+    column owns two adjacent logical values, so ``tRS_rD`` has twice as many
+    fp32 lanes while the SF slot/coordinate tensors remain in accumulator-pair
+    space. The two values share that pair's slot, making 16 pair columns one
+    ordinary 32-value MXFP8 block.
 
     ``xwarp`` (SF vectors spanning warps along their axis, SM120 warp MMA): a
     ``(sExch, tDcD_cur, (epi_m, epi_n), (div_m, div_n), warp_member,
@@ -871,6 +901,14 @@ def sfd_quantize_subtile(
     tDrScale_flt = cute.filter_zeros(tDrScale)
     tDrSFD_flt = cute.filter_zeros(tDrSFD_cur)
     tDrAmax_flt.fill(0.0)
+    packed_pair = None
+    if const_expr(pack_factor == 2):
+        packed_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
+        frag0, frag1 = packed_pair[0, ...], packed_pair[1, ...]
+        frag_size = cute.size(frag0)
+    else:
+        assert pack_factor == 1
+        frag_size = cute.size(tRS_rD)
     # Zero-stride broadcast layout accumulates each element into its SF slot,
     # independent of the fragment's register order. Off SM100, the whole fold
     # — element accumulate, lane butterfly, cross-warp exchange — runs on
@@ -882,13 +920,20 @@ def sfd_quantize_subtile(
     # (abs is an operand modifier there, and FMNMX3 is SM100-only), which
     # the two-input xorsign form would defeat.
     xorsign = const_expr(gemm.arch != 100)
-    for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+    for i in cutlass.range(frag_size, unroll_full=True):
+        slot_i = acc_stride * i
         if const_expr(xorsign):
-            tDrAmax[acc_stride * i] = cute.arch.fmax(tDrAmax[acc_stride * i], tRS_rD[i], abs=True)
+            if const_expr(pack_factor == 2):
+                amax = cute.arch.fmax(frag0[i], frag1[i], abs=True)
+                tDrAmax[slot_i] = cute.arch.fmax(tDrAmax[slot_i], amax, abs=True)
+            else:
+                tDrAmax[slot_i] = cute.arch.fmax(tDrAmax[slot_i], tRS_rD[i], abs=True)
         else:
-            tDrAmax[acc_stride * i] = cute.arch.fmax(
-                tDrAmax[acc_stride * i], cute.math.absf(tRS_rD[i])
-            )
+            if const_expr(pack_factor == 2):
+                amax = cute.arch.fmax(cute.math.absf(frag0[i]), cute.math.absf(frag1[i]))
+                tDrAmax[slot_i] = cute.arch.fmax(tDrAmax[slot_i], amax)
+            else:
+                tDrAmax[slot_i] = cute.arch.fmax(tDrAmax[slot_i], cute.math.absf(tRS_rD[i]))
     if const_expr(lane_span > 1):
         # SF vectors split across lane_span consecutive lane subgroups along
         # the vector's axis: butterfly-combine the per-lane partial amaxes;
@@ -913,14 +958,14 @@ def sfd_quantize_subtile(
         # same value to the same slot — benign. The coord partition lives in
         # ACC space, so a halved gated fragment indexes it at acc_stride * i,
         # same as the slot tensors.
-        for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+        for i in cutlass.range(frag_size, unroll_full=True):
             c = tDcD_cur[acc_stride * i]
             sExch[(c[0] % epi_m_size) // div_m, (c[1] % epi_n_size) // div_n, warp_member] = (
                 tDrAmax[acc_stride * i]
             )
         barrier.arrive_and_wait()
         # Fold in every member's partial (including our own — idempotent).
-        for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+        for i in cutlass.range(frag_size, unroll_full=True):
             c = tDcD_cur[acc_stride * i]
             v = tDrAmax[acc_stride * i]
             for j in cutlass.range_constexpr(warp_span):
@@ -937,8 +982,12 @@ def sfd_quantize_subtile(
     # Shared quantize core: SF bytes + rescale factors from the amaxes (see
     # quack.blockscaled.quantize_utils for the cuBLAS/CUTLASS semantics contract).
     quantize_sf_slots(tDrAmax_flt, tDrSFD_flt, tDrScale_flt, value_dtype, norm_const=norm_const)
-    for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
-        tRS_rD[i] = tRS_rD[i] * tDrScale[acc_stride * i]
+    for i in cutlass.range(frag_size, unroll_full=True):
+        scale = tDrScale[acc_stride * i]
+        if const_expr(pack_factor == 2):
+            frag0[i], frag1[i] = frag0[i] * scale, frag1[i] * scale
+        else:
+            tRS_rD[i] = tRS_rD[i] * scale
 
 
 @cute.jit

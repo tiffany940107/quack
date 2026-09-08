@@ -138,6 +138,27 @@ class GemmBase:
             cute.make_layout(shape, stride=stride),
         )
 
+    def _recast_packed_fp8x2(self, mT):
+        """Trace-time Int16 view of an N-major ``(..., 2N)`` fp8 tensor.
+
+        Packed dgated auxiliary outputs keep their public shape/dtype so the
+        result is directly consumable as MXFP8. Internally, the GEMM has only
+        N accumulator columns, so adjacent fp8 lanes cross the TMA store path
+        as one Int16 word. Host validation guarantees an even contiguous N
+        extent and even outer strides.
+        """
+        shape = tuple(s // 2 if i == 1 else s for i, s in enumerate(mT.shape))
+        stride = tuple(
+            s
+            if const_expr(i == 1)
+            else (s // 2 if const_expr(cute.is_static(s)) else cute.assume(s // 2, divby=4))
+            for i, s in enumerate(mT.stride)
+        )
+        return cute.make_tensor(
+            cute.recast_ptr(mT.iterator, dtype=cutlass.Int16),
+            cute.make_layout(shape, stride=stride),
+        )
+
     def rotate_batch_last(self, mA, mB, mD, mC, epilogue_args, append_batch_if_2d=False):
         """Rotate all batched inputs from caller order (l, x, y) to kernel order (x, y, l).
 
@@ -205,21 +226,29 @@ class GemmBase:
         if const_expr(epilogue_args is None):
             return epilogue_args
         epi_ops = getattr(self, "_epi_ops", ())
-        tile_fields = {op.name for op in epi_ops if isinstance(op, (TileLoad, TileStore))}
+        tile_ops = {op.name: op for op in epi_ops if isinstance(op, (TileLoad, TileStore))}
+        tile_fields = set(tile_ops)
         reduce_fields = {op.name for op in epi_ops if isinstance(op, VecReduce)}
         rotated = {}
         for name, v in zip(epilogue_args._fields, epilogue_args):
             if not isinstance(v, cute.Tensor):
                 continue
+            new_v = v
             if name in tile_fields:
                 if cute.rank(v) == 3:
-                    rotated[name] = layout_utils.select(v, [1, 2, 0])
+                    new_v = layout_utils.select(v, [1, 2, 0])
                 elif append_batch_if_2d and cute.rank(v) == 2:
-                    rotated[name] = layout_utils.expand(v, 2, 1)
-                if const_expr(self.cd_transposed) and name in rotated:
-                    rotated[name] = layout_utils.select(rotated[name], [1, 0, 2])
+                    new_v = layout_utils.expand(v, 2, 1)
+                if const_expr(self.cd_transposed and new_v is not v):
+                    new_v = layout_utils.select(new_v, [1, 0, 2])
+                op = tile_ops[name]
+                if const_expr(isinstance(op, TileStore) and op.packed_dtype is not None):
+                    assert not self.cd_transposed, "packed TileStore does not support swap_ab"
+                    new_v = self._recast_packed_fp8x2(new_v)
             elif name in reduce_fields and append_batch_if_2d and cute.rank(v) == 2:
-                rotated[name] = layout_utils.expand(v, 0, 1)
+                new_v = layout_utils.expand(v, 0, 1)
+            if const_expr(new_v is not v):
+                rotated[name] = new_v
         return epilogue_args._replace(**rotated) if rotated else epilogue_args
 
     @dataclass

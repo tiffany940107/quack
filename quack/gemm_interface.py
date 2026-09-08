@@ -1084,18 +1084,20 @@ def gemm(
     # Eager plan fast path: replay of a previously validated call with different
     # data pointers. The key covers everything the slow path's decisions read,
     # including the alpha/sr modes: the captured dispatch plan depends on them,
-    # so this key must subsume the dispatch key. Varlen/gather/permute/concat
-    # calls always take the general path; compiled code and quantized outputs
-    # take the custom-op route below.
+    # so this key must subsume the dispatch key. In addition to the original
+    # dense path, blockscaled calls may use varlen offsets; their complete
+    # tensor metadata is part of the key while current values are forwarded on
+    # every replay. Keep ordinary BF16 varlen/gather/permute/concat calls on the
+    # general path. Compiled code and quantized outputs take the custom-op route.
     plan_key = None
-    if not torch.compiler.is_compiling() and (
+    is_plain_dense = (
         cu_seqlens_m is None
         and cu_seqlens_k is None
         and A_idx is None
         and batch_idx_permute is None
         and not concat_layout
-        and fmt_d is None
-    ):
+    )
+    if not torch.compiler.is_compiling() and fmt_d is None and (is_plain_dense or SFA is not None):
         plan_key = (
             tensor_key(A),
             tensor_key(B),
@@ -1103,6 +1105,11 @@ def gemm(
             tensor_key(bias),
             tensor_key(SFA),
             tensor_key(SFB),
+            tensor_key(cu_seqlens_m),
+            tensor_key(cu_seqlens_k),
+            tensor_key(A_idx),
+            tensor_key(batch_idx_permute),
+            tuple(concat_layout) if concat_layout else None,
             bs_format_a,
             bs_format_b,
             opA.quant_dim,
@@ -1132,16 +1139,16 @@ def gemm(
                 bias=bias,
                 alpha=alpha,
                 beta=1.0,
-                cu_seqlens_m=None,
-                cu_seqlens_k=None,
-                A_idx=None,
-                batch_idx_permute=None,
+                cu_seqlens_m=cu_seqlens_m,
+                cu_seqlens_k=cu_seqlens_k,
+                A_idx=A_idx,
+                batch_idx_permute=batch_idx_permute,
                 add_to_output=False,
                 dynamic_scheduler=plan.dynamic_scheduler,
                 config=plan.config,
                 rounding_mode=rounding_mode,
                 sr_seed=sr_seed,
-                concat_layout=None,
+                concat_layout=concat_layout,
                 SFA=SFA,
                 SFB=SFB,
                 bs_format_a=bs_format_a,

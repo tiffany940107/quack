@@ -20,10 +20,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.blockscaled.quantize import nvfp4_per_tensor_scale, unpack_scale_blocked_to_2d
+from quack import gemm_interface
 from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
-from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
-from quack.blockscaled.utils import blockscaled_quantize_dim0
+from quack.blockscaled.quantize import nvfp4_per_tensor_scale, unpack_scale_blocked_to_2d
+from quack.blockscaled.utils import (
+    blockscaled_quantize,
+    blockscaled_quantize_dim0,
+    scale_blocked_for_cublas,
+)
 from quack.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
@@ -248,14 +252,10 @@ def test_blockscaled_gemm_varlen_m_gated_quant_store_preact():
     )
 
     cu = cu_seqlens_m.tolist()
-    preact_ref = torch.cat(
-        [a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)]
-    )
+    preact_ref = torch.cat([a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)])
     assert _rel_err(preact, preact_ref) < 5e-3
     postact_ref = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
-    padded_sf = unpack_scale_blocked_to_2d(
-        postact_sf, padded_rm * 128, intermediate // 32
-    )[0]
+    padded_sf = unpack_scale_blocked_to_2d(postact_sf, padded_rm * 128, intermediate // 32)[0]
     active_sf = torch.cat(
         [
             padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
@@ -266,6 +266,76 @@ def test_blockscaled_gemm_varlen_m_gated_quant_store_preact():
     dequant = postact.float() * scale
     bound = scale * (16.0 * 1.05) + 1e-2
     assert ((dequant - postact_ref).abs() <= bound).all()
+
+
+def test_blockscaled_varlen_dgated_quantizes_dpreact():
+    """FC2 dgrad emits BF16 dpreact and its MXFP8 consumer view together."""
+    _skip_if_not_sm100()
+    import cutlass
+
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from quack.epilogue.library import dgated_dquant_mod
+
+    seqlens_m = [100, 156, 128]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts,
+        0,
+        n,
+        k,
+        32,
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        seqlens_m=seqlens_m,
+    )
+    total_m = sum(seqlens_m)
+    padded_rm = (total_m + 127) // 128 + num_experts - 1
+    preact = torch.randn(total_m, 2 * n, dtype=torch.bfloat16, device="cuda")
+    score = torch.rand(total_m, dtype=torch.float32, device="cuda") + 0.5
+    dpreact = torch.empty_like(preact)
+    dpreact_q = torch.empty_like(preact, dtype=torch.float8_e4m3fn)
+    dpreact_sf = torch.empty(
+        (1, padded_rm, (2 * n) // 128, 32, 4, 4),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    postact = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    result = dgated_dquant_mod("swiglu", has_scale=True, has_reduce=True)(
+        qa,
+        qb.permute(2, 1, 0),
+        preact,
+        out={"D": dpreact, "mDQuant": dpreact_q, "mAuxOut": postact},
+        tuned=False,
+        dynamic_scheduler=False,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+        mColVecBroadcast=score,
+        mDQuant_sf=dpreact_sf,
+    )
+
+    cu = cu_seqlens_m.tolist()
+    dout = torch.cat([a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)])
+    preact_ref = preact.detach().float().requires_grad_()
+    gated = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
+    (gated * score[:, None] * dout).sum().backward()
+    assert _rel_err(dpreact, preact_ref.grad) < 1e-2
+    assert _rel_err(postact, gated * score[:, None]) < 1e-2
+    assert _rel_err(result["mColVecReduce"], (gated * dout).sum(-1)) < 1e-3
+
+    padded_sf = unpack_scale_blocked_to_2d(dpreact_sf, padded_rm * 128, (2 * n) // 32)[0]
+    active_sf = torch.cat(
+        [
+            padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
+            for i in range(num_experts)
+        ]
+    ).float()
+    dequant = dpreact_q.float() * active_sf.repeat_interleave(32, dim=-1)
+    bound = active_sf.repeat_interleave(32, dim=-1) * (16.0 * 1.05) + 1e-2
+    assert ((dequant - preact_ref.grad).abs() <= bound).all()
 
 
 @pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [96, 160, 128], [100, 220, 65]])
@@ -293,6 +363,31 @@ def test_blockscaled_gemm_varlen_k(seqlens_k):
     ref = torch.stack([a_ref_list[i] @ b_ref_list[i].T for i in range(num_experts)])
     err = (out.float() - ref).abs().max().item()
     assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} max_err={err}"
+
+
+def test_blockscaled_varlen_k_iface_plan_replays_runtime_offsets():
+    """Warm plans must consume each call's offsets rather than capturing values."""
+    _skip_if_not_sm100()
+    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
+
+    gemm_interface._gemm_iface_plan_cache.clear()
+    cache_size = None
+    for seed, seqlens_k in enumerate(([96, 160, 128], [128, 128, 128])):
+        torch.manual_seed(seed)
+        operands = create_blockscaled_varlen_k_operands(3, 0, 256, 256, 32, seqlens_k=seqlens_k)
+        a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_k = operands
+        A = BlockScaledOperand.from_parts(qa, sfa, "mxfp8")
+        B = BlockScaledOperand.from_parts(qb.t(), sfb, "mxfp8", quant_dim=-2)
+
+        out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False)
+        ref = torch.stack([a_ref[i] @ b_ref[i].T for i in range(3)])
+        assert (out.float() - ref).abs().max() < 5e-3
+
+        if cache_size is None:
+            cache_size = len(gemm_interface._gemm_iface_plan_cache)
+            assert cache_size == 1
+        else:
+            assert len(gemm_interface._gemm_iface_plan_cache) == cache_size
 
 
 def test_blockscaled_gemm_vs_cublas():

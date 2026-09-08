@@ -27,7 +27,7 @@ from __future__ import annotations
 import functools
 
 
-from cutlass import Int32
+from cutlass import Float8E4M3FN, Int32
 
 from quack.activation import (
     act_fn_map,
@@ -740,6 +740,50 @@ def dgated_mod(activation, *, has_scale, has_reduce):
     fn = _gen_epi_fn("dgated_epi", tag, params, body, {"dgate": dgate})
     return gemm_epilogue(
         outputs=("mAuxOut",),
+        ops=_vec_pins(params),
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
+        if has_reduce
+        else None,
+        mode="packed_cd_b16x2",
+    )(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def dgated_dquant_mod(activation, *, has_scale, has_reduce):
+    """``dgated_mod`` with an additional rowwise blockscaled dpreact store.
+
+    ``D`` remains the BF16 dpreact required by wgrad and bias reductions, while
+    ``mDQuant`` / ``mDQuant_sf`` are a directly consumable MXFP8 view for the
+    preceding layer's dgrad GEMM.  Both outputs are formed from the same
+    accumulator fragment, so no standalone read/quantize launch is needed.
+    """
+    dgate = dgate_fn_map[activation]
+    params, body = ["c"], []
+    if has_scale:
+        params.append("mColVecBroadcast")
+    body.append("x, y = unpack(c)")
+    dout = "acc * mColVecBroadcast" if has_scale else "acc"
+    body.append(f"dx, dy, out = dgate(x, y, {dout})")
+    postact = "out * mColVecBroadcast" if has_scale else "out"
+    dpreact = "pack(dx, dy)"
+    if has_reduce:
+        body.append(
+            f'return {{"D": {dpreact}, "mDQuant": {dpreact}, '
+            f'"mAuxOut": {postact}, "mColVecReduce": (out, acc)}}'
+        )
+    else:
+        body.append(f'return {{"D": {dpreact}, "mDQuant": {dpreact}, "mAuxOut": {postact}}}')
+    tag = f"dgated_dquant:{activation}:s{int(has_scale)}r{int(has_reduce)}"
+    fn = _gen_epi_fn("dgated_dquant_epi", tag, params, body, {"dgate": dgate})
+    return gemm_epilogue(
+        outputs=(
+            "mAuxOut",
+            TileStore(
+                "mDQuant",
+                quant=BlockScaleFactorStore("mDQuant_sf", output="mDQuant", pack_factor=2),
+                packed_dtype=Float8E4M3FN,
+            ),
+        ),
         ops=_vec_pins(params),
         reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
         if has_reduce

@@ -211,13 +211,34 @@ class _EpiModMixinBase(ComposableEpiMixin):
                     views[name] = _dense1(frags[name])
                 elif const_expr(kind != "c"):
                     views[name] = frags[name]  # scalar / dense tile frag / apply pstate
+            # Ordinary packed_cd auxiliary outputs are one scalar per
+            # accumulator pair (postact). A packed TileStore is different:
+            # it exposes the full interleaved (dx, dy) stream, so retain the
+            # recast C fragment's two-lane layout until its store converts and
+            # packs the values to fp8x2/Int16.
             outs = tuple(
-                cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-                for _ in self._epi_mod_outputs
+                cute.make_rmem_tensor(
+                    (
+                        xy16.layout
+                        if getattr(ops_by_name[name], "packed_dtype", None) is not None
+                        else tRS_rD.layout.shape
+                    ),
+                    self.acc_dtype,
+                )
+                for name in self._epi_mod_outputs
+            )
+
+            def _pair_views(out):
+                p = cute.flat_divide(out, cute.make_layout(2))
+                return p[0, ...], p[1, ...]
+
+            out_pair_views = tuple(
+                _pair_views(out)
+                if getattr(ops_by_name[name], "packed_dtype", None) is not None
+                else None
+                for name, out in zip(self._epi_mod_outputs, outs)
             )
             sink_tmps = self._make_sink_tmps(ops_by_name, tRS_rD.layout.shape)
-            val_names = self._epi_mod_outputs + self._epi_mod_sinks
-            val_frags = outs + sink_tmps
             vectorize = const_expr(self.arch == 100 and self._epi_mod_vectorize is not False)
             for i in cutlass.range(n_el, vectorize=vectorize):
                 kw = {
@@ -233,7 +254,13 @@ class _EpiModMixinBase(ComposableEpiMixin):
                 res = fn(tRS_rD[i], **kw)
                 d = res["D"]  # required: it carries the (dx, dy) pair to pack
                 dxv[i], dyv[i] = d[0], d[1]
-                for vname, vfrag in zip(val_names, val_frags):
+                for vname, vfrag, pair_view in zip(self._epi_mod_outputs, outs, out_pair_views):
+                    v = res[vname]
+                    if const_expr(pair_view is not None):
+                        pair_view[0][i], pair_view[1][i] = v[0], v[1]
+                    else:
+                        vfrag[i] = v
+                for vname, vfrag in zip(self._epi_mod_sinks, sink_tmps):
                     if const_expr(isinstance(vfrag, tuple)):
                         # Scaled sink: the fn returns the (val, scale) factors.
                         v, s = res[vname]
