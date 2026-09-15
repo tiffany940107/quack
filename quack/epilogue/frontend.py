@@ -212,9 +212,8 @@ _EPI_MODES = {
 }
 
 
-def _blockscaled_default_for_mode(mode, m, n, device):
+def _single_cta_default_for_mode(mode, config, device):
     cap = get_device_capacity(device)[0]
-    config = blockscaled_default_config(m, n, device_capacity=cap)
     if mode == "packed_d_b16x2_c_fp8x2" and cap in (10, 11):
         # The manual varlen scale load is safe only within one 128-row CTA.
         # Tile-N 128 is also the best no-tune choice for the target DGated
@@ -1669,9 +1668,12 @@ class EpiMod:
             if config is not None:
                 cfg = config
             elif SFA is not None:
-                cfg = _blockscaled_default_for_mode(self.mode, A.shape[-2], n, A.device)
+                cfg = blockscaled_default_config(
+                    A.shape[-2], n, device_capacity=get_device_capacity(A.device)[0]
+                )
             else:
                 cfg = self._default_config(A, B, transform_a)
+            cfg = _single_cta_default_for_mode(self.mode, cfg, A.device)
             if needs_transform_operands:
                 # tile_K None resolves inside bundle() to the 16-bit kernel
                 # default, mirrored by fake_bundle at trace.
@@ -1748,9 +1750,12 @@ class EpiMod:
         if config is not None:
             cfg = config
         elif SFA is not None:
-            cfg = _blockscaled_default_for_mode(self.mode, A.shape[-2], n, A.device)
+            cfg = blockscaled_default_config(
+                A.shape[-2], n, device_capacity=get_device_capacity(A.device)[0]
+            )
         else:
             cfg = self._default_config(A, B, transform_a)
+        cfg = _single_cta_default_for_mode(self.mode, cfg, A.device)
         dyn = dynamic_scheduler or cfg.is_dynamic_persistent
         out = dict(out)
         D = out.get("D")
