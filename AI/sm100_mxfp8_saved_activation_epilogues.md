@@ -15,8 +15,11 @@ rowwise scale in registers, and produce BF16 dpreactivation. A second variant
 also emits the rowwise MXFP8 dpreactivation used by full-MXFP8 FC1 dgrad.
 
 For clustered-M kernels, phantom partner-CTA rows clamp their scale address to
-the final valid expert row. Their output stores remain predicated. BF16-C
-DGated remains available as the fallback.
+the final valid expert row. Epilogue columns beyond the true GEMM N similarly
+clamp to the final packed-C column: their stores remain predicated, but their
+zero accumulators still participate in the column reduction, so loading an
+uninitialized E8M0 padding byte there would otherwise turn `0 * NaN` into a
+NaN router-score gradient. BF16-C DGated remains available as the fallback.
 
 ## Layout contract
 
@@ -33,7 +36,9 @@ the associated register-pressure cliff.
 
 Correctness covers tile-N 64/128/192/256, cluster-M 1/2, cluster-N 1/2,
 non-aligned and empty expert rows, score scaling, reduction, and fused
-dpreactivation quantization.
+dpreactivation quantization. The BF16-mainloop regression poisons every
+inactive scale-padding byte with E8M0 NaN to prove that valid reductions never
+read it.
 
 ## Reference and attribution
 

@@ -193,15 +193,16 @@ class BlockScaleFactorLoad(EpiOp):
         m_base = ctx.tile_coord_mnkl[0] * ctx.tile_M
         n_base = ctx.tile_coord_mnkl[1] * ctx.tile_N
         limit_m = ctx.varlen_manager.len_m(ctx.batch_idx)
-        return scale_mn, coords, m_base, n_base, limit_m
+        limit_n = ctx.varlen_manager.len_n()
+        return scale_mn, coords, m_base, n_base, limit_m, limit_n
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        scale_mn, coords, m_base, n_base, limit_m = state
+        scale_mn, coords, m_base, n_base, limit_m, limit_n = state
         coords_cur = cute.group_modes(coords, 3, cute.rank(coords))[
             None, None, None, epi_coord
         ]
-        return scale_mn, coords_cur, m_base, n_base, limit_m
+        return scale_mn, coords_cur, m_base, n_base, limit_m, limit_n
 
     @cute.jit
     def fn_prepare_packed_c(self, gemm, state, values):
@@ -212,7 +213,7 @@ class BlockScaleFactorLoad(EpiOp):
         the occupancy cliff.  Apply each scale directly to its two FP8 lanes
         instead, matching the lifetime of the hand-written DGated path.
         """
-        scale_mn, coords, m_base, n_base, limit_m = state
+        scale_mn, coords, m_base, n_base, limit_m, limit_n = state
         # SM100's packed-D epilogue gives each thread contiguous runs of pair
         # columns on one row.  One scale covers 16 pairs.  When tile-N is a
         # multiple of 128, every subtile run starts on that boundary; the
@@ -226,7 +227,7 @@ class BlockScaleFactorLoad(EpiOp):
             row = m_base + coord[0]
             if const_expr(gemm.cluster_shape_mnk[0] > 1):
                 row = cutlass.min(row, limit_m - 1)
-            pair_col = n_base + coord[1]
+            pair_col = cutlass.min(n_base + coord[1], limit_n - 1)
             scale = scale_mn[row, pair_col * 2].to(Float32)
             for j in cutlass.range(reuse, unroll_full=True):
                 i = base + j

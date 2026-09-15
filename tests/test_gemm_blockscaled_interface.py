@@ -518,7 +518,8 @@ def test_blockscaled_varlen_dgated_fp8_preact_quantizes_dpreact():
     active_dsf = torch.cat(
         [
             padded_dsf[
-                (cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]
+                (cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128
+                + seqlens_m[i]
             ]
             for i in range(num_experts)
         ]
@@ -534,39 +535,56 @@ def test_varlen_dgated_bf16_mainloop_loads_fp8_preact():
     _skip_if_not_sm100()
 
     from quack.blockscaled import quantize_mxfp8_varlen_m
+    from quack.blockscaled.quantize import pack_scale_2d_to_blocked_contig
     from quack.epilogue.library import dgated_fp8_preact_mod
 
     torch.manual_seed(123)
-    seqlens_m = [100, 156, 256]
+    seqlens_m = [8, 19, 9, 17, 18, 19, 20, 20]
     experts = len(seqlens_m)
     total_m = sum(seqlens_m)
-    n, k = 256, 256
+    n, k = 128, 128
     offsets = torch.tensor(
         [0, *torch.tensor(seqlens_m).cumsum(0).tolist()],
         dtype=torch.int32,
         device="cuda",
     )
-    dout = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda") * 0.1
+    dout_tokens = torch.randn(total_m // 2, k, dtype=torch.bfloat16, device="cuda") * 0.1
+    gather_idx = (torch.randperm(total_m, device="cuda") % dout_tokens.shape[0]).int()
     weight = torch.randn(experts, k, n, dtype=torch.bfloat16, device="cuda") * 0.1
     preact_hp = torch.randn(total_m, 2 * n, dtype=torch.bfloat16, device="cuda") * 0.1
     preact = quantize_mxfp8_varlen_m(preact_hp, offsets)
+    padded_rows = preact.scale.shape[1] * 128
+    scale_2d = unpack_scale_blocked_to_2d(
+        preact.scale, padded_rows, (2 * n) // 32
+    )
+    poisoned_scale_2d = torch.full_like(
+        scale_2d.view(torch.uint8), 255
+    ).view(torch.float8_e8m0fnu)
+    cu = offsets.tolist()
+    for i, length in enumerate(seqlens_m):
+        start = (cu[i] // 128 + i) * 128
+        poisoned_scale_2d[:, start : start + length] = scale_2d[
+            :, start : start + length
+        ]
+    preact_scale = pack_scale_2d_to_blocked_contig(poisoned_scale_2d)
+    score = torch.rand(total_m, dtype=torch.float32, device="cuda") + 0.5
     dpreact = torch.empty_like(preact_hp)
     postact = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
 
-    dgated_fp8_preact_mod("swiglu", has_scale=False, has_reduce=False)(
-        dout,
+    result = dgated_fp8_preact_mod("swiglu", has_scale=True, has_reduce=True)(
+        dout_tokens,
         weight,
         preact.qdata,
         out={"D": dpreact, "mAuxOut": postact},
         tuned=False,
         dynamic_scheduler=False,
         cu_seqlens_m=offsets,
-        preact_scale=preact.scale,
+        A_idx=gather_idx,
+        preact_scale=preact_scale,
+        mColVecBroadcast=score,
     )
 
-    cu = offsets.tolist()
-    padded_rows = preact.scale.shape[1] * 128
-    padded_sf = unpack_scale_blocked_to_2d(preact.scale, padded_rows, (2 * n) // 32)[0]
+    padded_sf = unpack_scale_blocked_to_2d(preact_scale, padded_rows, (2 * n) // 32)[0]
     active_sf = torch.cat(
         [
             padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
@@ -574,14 +592,21 @@ def test_varlen_dgated_bf16_mainloop_loads_fp8_preact():
         ]
     ).float()
     preact_dq = preact.qdata.float() * active_sf.repeat_interleave(32, dim=-1)
+    dout_grouped = dout_tokens[gather_idx]
     dout_ref = torch.cat(
-        [dout[cu[i] : cu[i + 1]].float() @ weight[i].float() for i in range(experts)]
+        [
+            dout_grouped[cu[i] : cu[i + 1]].float() @ weight[i].float()
+            for i in range(experts)
+        ]
     )
     preact_ref = preact_dq.detach().requires_grad_()
     postact_ref = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
-    (dpreact_ref,) = torch.autograd.grad(postact_ref, preact_ref, dout_ref)
+    (dpreact_ref,) = torch.autograd.grad(
+        postact_ref, preact_ref, dout_ref * score[:, None]
+    )
     assert _rel_err(dpreact, dpreact_ref) < 1e-2
-    assert _rel_err(postact, postact_ref) < 1e-2
+    assert _rel_err(postact, postact_ref * score[:, None]) < 1e-2
+    assert _rel_err(result["mColVecReduce"], (postact_ref * dout_ref).sum(-1)) < 1e-3
 
 
 def test_blockscaled_varlen_dgated_quantizes_dpreact():
