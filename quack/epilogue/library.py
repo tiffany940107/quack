@@ -855,7 +855,7 @@ def dgated_fp8_preact_mod(activation, *, has_scale, has_reduce):
     if has_reduce:
         body.append(
             f'return {{"D": pack(dx, dy), "mAuxOut": {postact}, '
-            '"mColVecReduce": (out, acc)}}'
+            '"mColVecReduce": (out, acc)}'
         )
     else:
         body.append(f'return {{"D": pack(dx, dy), "mAuxOut": {postact}}}')

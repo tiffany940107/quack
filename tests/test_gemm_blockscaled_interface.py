@@ -425,7 +425,10 @@ def test_blockscaled_varlen_dgated_fp8_preact_quantizes_dpreact():
 
     from quack.blockscaled import quantize_mxfp8_varlen_m
     from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
-    from quack.epilogue.library import dgated_fp8_preact_dquant_mod
+    from quack.epilogue.library import (
+        dgated_fp8_preact_dquant_mod,
+        dgated_fp8_preact_mod,
+    )
 
     seqlens_m = [100, 156, 256]
     num_experts = len(seqlens_m)
@@ -469,6 +472,23 @@ def test_blockscaled_varlen_dgated_fp8_preact_quantizes_dpreact():
         mColVecBroadcast=score,
         mDQuant_sf=dpreact_sf,
     )
+    plain_dpreact = torch.empty_like(dpreact)
+    plain_postact = torch.empty_like(postact)
+    plain_result = dgated_fp8_preact_mod("swiglu", has_scale=True, has_reduce=True)(
+        qa,
+        qb.permute(2, 1, 0),
+        preact.qdata,
+        out={"D": plain_dpreact, "mAuxOut": plain_postact},
+        tuned=False,
+        dynamic_scheduler=False,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+        preact_scale=preact.scale,
+        mColVecBroadcast=score,
+    )
 
     cu = cu_seqlens_m.tolist()
     padded_rows = preact.scale.shape[1] * 128
@@ -487,6 +507,9 @@ def test_blockscaled_varlen_dgated_fp8_preact_quantizes_dpreact():
     assert _rel_err(dpreact, preact_ref.grad) < 1e-2
     assert _rel_err(postact, gated * score[:, None]) < 1e-2
     assert _rel_err(result["mColVecReduce"], (gated * dout).sum(-1)) < 1e-3
+    assert _rel_err(plain_dpreact, preact_ref.grad) < 1e-2
+    assert _rel_err(plain_postact, gated * score[:, None]) < 1e-2
+    assert _rel_err(plain_result["mColVecReduce"], (gated * dout).sum(-1)) < 1e-3
 
     padded_dsf = unpack_scale_blocked_to_2d(dpreact_sf, padded_rm * 128, (2 * n) // 32)[0]
     active_dsf = torch.cat(
