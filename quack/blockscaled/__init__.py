@@ -58,6 +58,7 @@ from quack.blockscaled.quantize import (  # noqa: F401
     to_nvfp4_compiled,
 )
 from quack.blockscaled.training import (  # noqa: F401
+    quantize_mxfp8_gather_varlen_m,
     quantize_mxfp8_varlen_k,
     quantize_mxfp8_varlen_m,
 )

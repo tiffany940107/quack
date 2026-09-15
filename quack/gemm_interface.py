@@ -508,7 +508,11 @@ def gemm_tuned(
     quant_out = SFD is not None or SFDCol is not None
     if config is None:
         if blockscaled:
-            m = A.shape[-2]
+            m = (
+                A_idx.shape[0]
+                if cu_seqlens_m is not None and A_idx is not None
+                else A.shape[-2]
+            )
             config = blockscaled_default_config(
                 m, B.shape[-1], device_capacity=get_device_capacity(A.device)[0]
             )
@@ -538,7 +542,6 @@ def gemm_tuned(
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
     if blockscaled:
-        assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert not config.swap_ab, "Blockscaled GEMM does not support swap_ab yet"
     if gather_A:

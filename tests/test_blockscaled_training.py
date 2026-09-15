@@ -7,10 +7,13 @@ import pytest
 import torch
 
 from quack.blockscaled import (
+    BlockScaledOperand,
+    quantize_mxfp8_gather_varlen_m,
     quantize_mxfp8_varlen_k,
     quantize_mxfp8_varlen_m,
     unpack_scale_blocked_to_2d,
 )
+from quack.gemm import gemm as gemm_dispatch
 from quack.gemm_interface import gemm, gemm_dact
 
 
@@ -63,6 +66,107 @@ def test_quantize_mxfp8_varlen_m_matches_rowwise_reference():
     assert torch.equal(result.qdata, q_ref)
     active_sf = _active_varlen_m_scales(result.scale, cu, x.shape[1] // 32)
     assert torch.equal(active_sf.view(torch.uint8), sf_ref.view(torch.uint8))
+
+
+def test_quantize_mxfp8_gather_varlen_m_keeps_physical_qdata():
+    _skip_if_not_sm100()
+    from quack.blockscaled.quantize import to_mx_compiled
+
+    torch.manual_seed(1)
+    physical_rows, hidden = 137, 256
+    cu = torch.tensor([0, 1, 129, 129, 258], dtype=torch.int32, device="cuda")
+    x = torch.randn(physical_rows, hidden, dtype=torch.bfloat16, device="cuda")
+    A_idx = torch.randint(physical_rows, (258,), dtype=torch.int32, device="cuda")
+    result = quantize_mxfp8_gather_varlen_m(x, A_idx, cu)
+    q_ref, sf_ref = to_mx_compiled(x)
+
+    assert result.shape == x.shape
+    assert torch.equal(result.qdata, q_ref)
+    active_sf = _active_varlen_m_scales(result.scale, cu, hidden // 32)
+    assert torch.equal(
+        active_sf.view(torch.uint8),
+        sf_ref.index_select(0, A_idx).view(torch.uint8),
+    )
+
+
+@pytest.mark.parametrize("use_tma_gather", [False, True])
+def test_blockscaled_gather_varlen_m_training_gemm(use_tma_gather):
+    """The logical route count can exceed physical T without materializing TK rows."""
+    _skip_if_not_sm100()
+    from quack.blockscaled.quantize import to_mx_compiled
+    from quack.epilogue.library import relu_mod
+
+    torch.manual_seed(2)
+    physical_rows, hidden, out_features = 137, 256, 256
+    cu = torch.tensor([0, 1, 129, 129, 258], dtype=torch.int32, device="cuda")
+    x = torch.randn(physical_rows, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+    A_idx = torch.randint(physical_rows, (258,), dtype=torch.int32, device="cuda")
+    weight_hp = (
+        torch.randn(4, out_features, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+    )
+    xq = quantize_mxfp8_gather_varlen_m(x, A_idx, cu)
+    weight = BlockScaledOperand.quantize(weight_hp, "mxfp8").mT
+
+    if use_tma_gather:
+        out = torch.empty(258, out_features, dtype=torch.bfloat16, device="cuda")
+        gemm_dispatch(
+            xq.qdata,
+            weight.qdata.mT,
+            out,
+            None,
+            None,
+            tile_M=128,
+            tile_N=128,
+            cluster_M=1,
+            cluster_N=1,
+            persistent=True,
+            is_dynamic_persistent=False,
+            cu_seqlens_m=cu,
+            A_idx=A_idx,
+            use_tma_gather=True,
+            SFA=xq.scale,
+            SFB=weight.scale,
+            bs_format_a="mxfp8_e4m3",
+            bs_format_b="mxfp8_e4m3",
+        )
+    else:
+        out = gemm(xq, weight, cu_seqlens_m=cu, A_idx=A_idx, tuned=False)
+
+    x_qdata, x_scale = to_mx_compiled(x)
+    x_dq = x_qdata.float() * x_scale.float().repeat_interleave(32, dim=-1)
+    weight_dq = weight.mT.dequantize(torch.float32)
+    offsets = cu.tolist()
+    ref = torch.cat(
+        [
+            x_dq[A_idx[offsets[e] : offsets[e + 1]].long()] @ weight_dq[e].T
+            for e in range(4)
+        ]
+    )
+    torch.testing.assert_close(out.float(), ref, rtol=5e-3, atol=5e-3)
+
+    epi_out = torch.empty_like(out)
+    postact = torch.empty_like(out)
+    relu_mod.gemm(
+        xq.qdata,
+        weight.qdata.mT,
+        epi_out,
+        epi_args={"postact": postact},
+        tile_M=128,
+        tile_N=128,
+        cluster_M=1,
+        cluster_N=1,
+        persistent=True,
+        is_dynamic_persistent=False,
+        cu_seqlens_m=cu,
+        A_idx=A_idx,
+        use_tma_gather=use_tma_gather,
+        SFA=xq.scale,
+        SFB=weight.scale,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+    torch.testing.assert_close(epi_out.float(), ref, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(postact.float(), ref.relu(), rtol=5e-3, atol=5e-3)
 
 
 def test_quantize_mxfp8_varlen_k_training_gemm():

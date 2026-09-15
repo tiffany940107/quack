@@ -780,11 +780,9 @@ class EpiMod:
             return plan
         if blockscaled:
             # Variable-M block scaling uses one tile-padded SFA batch for the
-            # concatenated rows and one dense SFB batch per sequence.  The
-            # SM100+ mainloops already implement that layout.  Gather remains
-            # unsupported because it needs a scale lookup for every A row.
-            if gather_A:
-                raise ValueError("blockscaled GEMM does not support gather_A yet")
+            # logical routed rows and one dense SFB batch per sequence.  With
+            # gather-A, qdata stays physically indexed while SFA is already in
+            # logical route order.
             if concat_key:
                 raise ValueError("blockscaled GEMM does not support concat_layout")
             if tile_K is not None:
@@ -1079,6 +1077,7 @@ class EpiMod:
                 b_kn=b_kn,
                 fmt_a=fmt_a,
                 fmt_b=fmt_b,
+                a_logical_m=A_idx.shape[0] if gather_A and varlen_m else None,
             )
         # Re-map pinned ops' kind for the device loop: explicit pins still
         # need a fragment kind; VecLoads present as their dim.

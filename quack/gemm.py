@@ -766,7 +766,6 @@ def _build_gemm_plan(
         # (torch has no fp6 dtype) and is reinterpreted in-kernel.
         a_mma_dtype = fmt_a.to_cutlass_dtype()
         b_mma_dtype = fmt_b.to_cutlass_dtype()
-        assert not gather_A, "Blockscaled GEMM does not support gather_A yet"
         assert not concat_layout, "Blockscaled GEMM does not support concat_layout"
         assert tile_K is None, "Blockscaled GEMM derives tile_K from the MMA instruction"
         if varlen_m:
@@ -786,6 +785,7 @@ def _build_gemm_plan(
             b_kn=b_kn,
             fmt_a=fmt_a,
             fmt_b=fmt_b,
+            a_logical_m=A_idx.shape[0] if gather_A and varlen_m else None,
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")

@@ -237,6 +237,10 @@ a tile-unit offset integer.
     padded buffer viewed as `(1, total_padded_rm, rk, 32, 4, 4)`, SFB per-batch
     `(L, rn, rk, 32, 4, 4)`. In `_compile_gemm` the fake SFA gets its own batch
     sym (its batch dim is 1, not `l`).
+    With `A_idx`, A qdata may instead contain only physical source rows; SFA is
+    still pre-gathered in logical route order and its minimum padded M extent
+    is computed from `A_idx.shape[0]`. Both cp.async and TMA gather mainloops
+    issue the corresponding SFA/SFB loads.
   - `quack/gemm.py::gemm(..., cu_seqlens_k=..., SFA=..., SFB=...)` — A is
     `(m, total_k)` m-major, B `(n, total_k)` n-major; both SFA and SFB are
     K-padded `(1, rm/rn, total_padded_rk, 32, 4, 4)` buffers (both fake SF

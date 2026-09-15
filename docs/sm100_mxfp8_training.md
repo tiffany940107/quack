@@ -7,19 +7,47 @@ E4M3 values with one E8M0 scale per 32 values.
 ## Variable-length operands
 
 ```python
-from quack.blockscaled import quantize_mxfp8_varlen_k, quantize_mxfp8_varlen_m
+from quack.blockscaled import (
+    quantize_mxfp8_gather_varlen_m,
+    quantize_mxfp8_varlen_k,
+    quantize_mxfp8_varlen_m,
+)
 
 # x is the expert-sorted (sum(M_e), K) activation.
 x_mx = quantize_mxfp8_varlen_m(x, expert_offsets)
 
 # g is (sum(K_e), N). Scaling restarts at every expert boundary.
 g_mx = quantize_mxfp8_varlen_k(g, expert_offsets)
+
+# x_physical is (T, K), while route_gather is (sum(M_e),). This keeps qdata
+# physical and gathers only the 32x-smaller scale rows into expert order.
+x_gather_mx = quantize_mxfp8_gather_varlen_m(
+    x_physical, route_gather, expert_offsets
+)
 ```
 
 Values remain densely concatenated. Scale storage inserts a 128-value atom at
 each expert boundary, including repeated offsets for empty experts. This makes
 the operands directly consumable by `gemm(..., cu_seqlens_m=...)` and
 `gemm(..., cu_seqlens_k=...)` without mixing scale groups across experts.
+
+For the gathered form, qdata has physical shape `(T, K)` while SFA describes
+the logical routed row count. Pass the exact same contiguous CUDA int32
+`route_gather` as `A_idx`:
+
+```python
+out = gemm(
+    x_gather_mx,
+    weight_mx,
+    cu_seqlens_m=expert_offsets,
+    A_idx=route_gather,
+    tuned=False,
+)
+```
+
+Both the cp.async and TMA gather mainloops load the block scales associated
+with the logical routed rows. Shape validation therefore sizes variable-M SFA
+from `A_idx.numel()`, not from the physical qdata row count.
 
 ## Fused FC1 epilogues
 

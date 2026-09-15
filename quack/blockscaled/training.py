@@ -79,6 +79,47 @@ def quantize_mxfp8_varlen_m(x: torch.Tensor, cu_seqlens_m: torch.Tensor) -> Bloc
     return BlockScaledOperand.from_parts(qdata, scale, MXFP8_E4M3, orig_dtype=x.dtype)
 
 
+def quantize_mxfp8_gather_varlen_m(
+    x: torch.Tensor,
+    A_idx: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+) -> BlockScaledOperand:
+    """Row-quantize physical ``x=(T, K)`` once for a gathered grouped GEMM.
+
+    ``A_idx=(sum(M_e),)`` maps logical routed rows to physical rows in ``x``.
+    The returned operand keeps only ``T * K`` FP8 values: scale rows, which are
+    32x smaller, are gathered into route order and padded so each expert starts
+    on a 128-row scale atom.  Pass the result and the same ``A_idx`` to a
+    variable-M block-scaled GEMM.
+    """
+    experts = _validate_inputs(x, cu_seqlens_m)
+    if A_idx.ndim != 1 or A_idx.dtype != torch.int32:
+        raise TypeError("A_idx must be a one-dimensional int32 tensor")
+    if A_idx.device != x.device:
+        raise ValueError("x and A_idx must be on the same device")
+    if not A_idx.is_contiguous():
+        raise ValueError("A_idx must be contiguous")
+    if x.shape[1] % _SF_VEC:
+        raise ValueError(f"K={x.shape[1]} must be divisible by {_SF_VEC}")
+    if x.shape[0] == 0 or A_idx.numel() == 0:
+        raise ValueError("fully empty physical or routed operands are not supported")
+
+    qdata, physical_scale = to_mx_compiled(x)
+    routed_scale = physical_scale.index_select(0, A_idx).contiguous()
+    destination, padded_rows = _padded_row_mapping(cu_seqlens_m, A_idx.numel(), experts)
+    padded_scale = torch.zeros(
+        padded_rows,
+        routed_scale.shape[1],
+        dtype=routed_scale.dtype,
+        device=x.device,
+    )
+    padded_scale.view(torch.uint8).index_copy_(
+        0, destination, routed_scale.view(torch.uint8)
+    )
+    scale = pack_scale_2d_to_blocked_contig(padded_scale.unsqueeze(0))
+    return BlockScaledOperand.from_parts(qdata, scale, MXFP8_E4M3, orig_dtype=x.dtype)
+
+
 def quantize_mxfp8_varlen_k(x: torch.Tensor, cu_seqlens_k: torch.Tensor) -> BlockScaledOperand:
     """Segment-quantize ``x=(sum(K_e), N)`` along its first dimension.
 
@@ -105,4 +146,8 @@ def quantize_mxfp8_varlen_k(x: torch.Tensor, cu_seqlens_k: torch.Tensor) -> Bloc
     )
 
 
-__all__ = ["quantize_mxfp8_varlen_k", "quantize_mxfp8_varlen_m"]
+__all__ = [
+    "quantize_mxfp8_gather_varlen_m",
+    "quantize_mxfp8_varlen_k",
+    "quantize_mxfp8_varlen_m",
+]

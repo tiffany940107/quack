@@ -1480,6 +1480,8 @@ class GemmSm100(GemmTmaBase):
                         copy_A,
                         prefetch_A,
                         copy_B,
+                        copy_SFA,
+                        copy_SFB,
                         k_tile_cnt,
                     )
                 else:
@@ -1490,6 +1492,8 @@ class GemmSm100(GemmTmaBase):
                         copy_A,
                         prefetch_A,
                         copy_B,
+                        copy_SFA,
+                        copy_SFB,
                         k_tile_cnt,
                     )
                 iket.range_pop()
@@ -2116,6 +2120,8 @@ class GemmSm100(GemmTmaBase):
         copy_A: Callable,
         prefetch_A: Optional[Callable],
         copy_B: Callable,
+        copy_SFA: Optional[Callable],
+        copy_SFB: Optional[Callable],
         k_tile_cnt: Int32,
         varlen_m: bool = True,
     ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
@@ -2140,6 +2146,10 @@ class GemmSm100(GemmTmaBase):
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
             if is_tma_warp:
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                if const_expr(copy_SFA is not None):
+                    copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                if const_expr(copy_SFB is not None):
+                    copy_SFB(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out)
             # This tells mbarrier to track the completion of cp.async
             ab_pipeline.producer_cpasync_commit(ab_producer_state)
@@ -2160,6 +2170,10 @@ class GemmSm100(GemmTmaBase):
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
             if is_tma_warp:
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                if const_expr(copy_SFA is not None):
+                    copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                if const_expr(copy_SFB is not None):
+                    copy_SFB(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out, pred=True)
             ab_pipeline.producer_cpasync_commit(ab_producer_state)
             ab_producer_state.advance()
@@ -2174,6 +2188,8 @@ class GemmSm100(GemmTmaBase):
         copy_A: Callable,
         prefetch_A: Optional[Callable],
         copy_B: Callable,
+        copy_SFA: Optional[Callable],
+        copy_SFB: Optional[Callable],
         k_tile_cnt: Int32,
     ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
         """Unified TMA gather loading loop for both varlen_m and varlen_k.
@@ -2197,6 +2213,10 @@ class GemmSm100(GemmTmaBase):
             tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
             if is_tma_warp:
                 copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                if const_expr(copy_SFA is not None):
+                    copy_SFA(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                if const_expr(copy_SFB is not None):
+                    copy_SFB(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out, tma_bar_ptr=tma_bar_ptr)
             ab_pipeline.producer_commit(ab_producer_state)
             ab_producer_state.advance()

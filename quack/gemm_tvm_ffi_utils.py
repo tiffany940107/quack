@@ -68,7 +68,18 @@ def _validate_tma_unpack_operands(A, B):
 
 
 def validate_blockscaled_sf(
-    A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False, b_kn=False, *, fmt_a, fmt_b
+    A,
+    B,
+    SFA,
+    SFB,
+    device_capacity,
+    num_batches=None,
+    varlen_k=False,
+    b_kn=False,
+    *,
+    fmt_a,
+    fmt_b,
+    a_logical_m=None,
 ):
     """Validate blockscaled scale factors against kernel-layout operands.
 
@@ -88,11 +99,11 @@ def validate_blockscaled_sf(
     contiguous (strides (16, 4, 1) - one 512 B atom per 128 rows x 4 K-blocks).
 
     When num_batches is not None and varlen_k is False (varlen_m), A is
-    (total_m, k) and SFA must be a single M-padded buffer (tile-aligned
-    per-batch padding) (1, total_padded_rm, rk, 32, 4, 4) with
-    total_padded_rm >= ceil(total_m/128) + (num_batches - 1) — the bound from
-    AI/varlen_blockscaled_sf_layout.md that suffices for any per-batch split
-    of total_m. SFB stays per-batch: (num_batches, rn, rk, 32, 4, 4).
+    (total_m, k), or (physical_m, k) when gather-A supplies ``a_logical_m``.
+    SFA must be a single M-padded buffer (tile-aligned per-batch padding)
+    (1, total_padded_rm, rk, 32, 4, 4) with total_padded_rm >=
+    ceil(logical_total_m/128) + (num_batches - 1). SFB stays per-batch:
+    (num_batches, rn, rk, 32, 4, 4).
 
     When varlen_k, A is (m, total_k) m-major and B is (n, total_k) n-major
     (MXFP8 only — fp4 operands must be K-major), and BOTH SF buffers are
@@ -186,16 +197,17 @@ def validate_blockscaled_sf(
             )
         shapes = []
     elif varlen_m:
-        assert A.ndim == 2, f"varlen_m expects A as (total_m, k), got shape {tuple(A.shape)}"
+        assert A.ndim == 2, f"varlen_m expects A as (rows, k), got shape {tuple(A.shape)}"
         assert B.shape[0] == num_batches, (
             f"B batch dim {B.shape[0]} != len(cu_seqlens_m) - 1 = {num_batches}"
         )
-        min_rm = (A.shape[0] + 127) // 128 + (num_batches - 1)
+        logical_m = A.shape[0] if a_logical_m is None else a_logical_m
+        min_rm = (logical_m + 127) // 128 + (num_batches - 1)
         assert SFA.shape[0] == 1 and tuple(SFA.shape[2:]) == (rk, 32, 4, 4), (
             f"SFA shape {tuple(SFA.shape)} != (1, total_padded_rm, {rk}, 32, 4, 4)"
         )
         assert SFA.shape[1] >= min_rm, (
-            f"SFA padded rm {SFA.shape[1]} < ceil(total_m/128) + (L-1) = {min_rm}"
+            f"SFA padded rm {SFA.shape[1]} < ceil(logical_total_m/128) + (L-1) = {min_rm}"
         )
         n = B.shape[-1] if b_kn else B.shape[-2]
         shapes = [("SFB", SFB, (num_batches, (n + 127) // 128, rk, 32, 4, 4))]
