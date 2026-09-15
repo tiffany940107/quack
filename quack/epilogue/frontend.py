@@ -158,7 +158,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import sys
-from dataclasses import replace
 from typing import NamedTuple, Optional
 
 
@@ -210,16 +209,6 @@ _EPI_MODES = {
     "packed_cd_b16x2",
     "packed_d_b16x2_c_fp8x2",
 }
-
-
-def _single_cta_default_for_mode(mode, config, device):
-    cap = get_device_capacity(device)[0]
-    if mode == "packed_d_b16x2_c_fp8x2" and cap in (10, 11):
-        # The manual varlen scale load is safe only within one 128-row CTA.
-        # Tile-N 128 is also the best no-tune choice for the target DGated
-        # training shape; callers can still pass a measured explicit config.
-        config = replace(config, tile_m=128, tile_n=128, cluster_m=1)
-    return config
 
 
 _KIND_TO_OP = {
@@ -1673,7 +1662,6 @@ class EpiMod:
                 )
             else:
                 cfg = self._default_config(A, B, transform_a)
-            cfg = _single_cta_default_for_mode(self.mode, cfg, A.device)
             if needs_transform_operands:
                 # tile_K None resolves inside bundle() to the 16-bit kernel
                 # default, mirrored by fake_bundle at trace.
@@ -1755,7 +1743,6 @@ class EpiMod:
             )
         else:
             cfg = self._default_config(A, B, transform_a)
-        cfg = _single_cta_default_for_mode(self.mode, cfg, A.device)
         dyn = dynamic_scheduler or cfg.is_dynamic_persistent
         out = dict(out)
         D = out.get("D")

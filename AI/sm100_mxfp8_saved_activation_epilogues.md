@@ -14,9 +14,9 @@ DGated backward can load the saved E4M3 preactivation through TMA, apply its
 rowwise scale in registers, and produce BF16 dpreactivation. A second variant
 also emits the rowwise MXFP8 dpreactivation used by full-MXFP8 FC1 dgrad.
 
-The scale loader currently requires `cluster_M=1`. The generic autotuner
-removes clustered-M candidates for this epilogue mode. BF16-C DGated remains
-available as the fallback.
+For clustered-M kernels, phantom partner-CTA rows clamp their scale address to
+the final valid expert row. Their output stores remain predicated. BF16-C
+DGated remains available as the fallback.
 
 ## Layout contract
 
@@ -31,8 +31,9 @@ pairs on other supported layouts. It applies that scale directly to the C
 fragment before the vectorized dgate loop, avoiding a second live fragment and
 the associated register-pressure cliff.
 
-Correctness covers tile-N 64/128/192/256, cluster-N 1/2, non-aligned expert
-rows, score scaling, reduction, and fused dpreactivation quantization.
+Correctness covers tile-N 64/128/192/256, cluster-M 1/2, cluster-N 1/2,
+non-aligned and empty expert rows, score scaling, reduction, and fused
+dpreactivation quantization.
 
 ## Reference and attribution
 

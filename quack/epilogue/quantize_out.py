@@ -141,9 +141,10 @@ class BlockScaleFactorLoad(EpiOp):
     storage stays in Quack's canonical blocked ``(L, rm, rk, 32, 4, 4)``
     layout; only a trace-time logical view is created.
 
-    The first implementation intentionally requires ``cluster_M=1``.  That
-    keeps every manual scale load within the expert's 128-row padded region;
-    a future clustered variant must predicate phantom partner-CTA rows.
+    Clustered-M kernels clamp phantom partner-CTA rows to the final valid row
+    before the manual load. The loaded value is irrelevant for those lanes,
+    whose D and auxiliary stores remain predicated, but the address must stay
+    inside this expert's padded scale region.
     """
 
     fn_port = "apply"
@@ -171,9 +172,6 @@ class BlockScaleFactorLoad(EpiOp):
     def to_params(self, gemm, args):
         scale = getattr(args, self.name)
         assert scale.element_type is cutlass.Float8E8M0FNU
-        assert gemm.cluster_shape_mnk[0] == 1, (
-            "FP8 preactivation scale loads currently require cluster_M=1"
-        )
         vec = 32
         m_pad = scale.shape[1] * 128
         n_pad = scale.shape[2] * 4 * vec
@@ -194,15 +192,16 @@ class BlockScaleFactorLoad(EpiOp):
         )
         m_base = ctx.tile_coord_mnkl[0] * ctx.tile_M
         n_base = ctx.tile_coord_mnkl[1] * ctx.tile_N
-        return scale_mn, coords, m_base, n_base
+        limit_m = ctx.varlen_manager.len_m(ctx.batch_idx)
+        return scale_mn, coords, m_base, n_base, limit_m
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        scale_mn, coords, m_base, n_base = state
+        scale_mn, coords, m_base, n_base, limit_m = state
         coords_cur = cute.group_modes(coords, 3, cute.rank(coords))[
             None, None, None, epi_coord
         ]
-        return scale_mn, coords_cur, m_base, n_base
+        return scale_mn, coords_cur, m_base, n_base, limit_m
 
     @cute.jit
     def fn_prepare_packed_c(self, gemm, state, values):
@@ -213,7 +212,7 @@ class BlockScaleFactorLoad(EpiOp):
         the occupancy cliff.  Apply each scale directly to its two FP8 lanes
         instead, matching the lifetime of the hand-written DGated path.
         """
-        scale_mn, coords, m_base, n_base = state
+        scale_mn, coords, m_base, n_base, limit_m = state
         # SM100's packed-D epilogue gives each thread contiguous runs of pair
         # columns on one row.  One scale covers 16 pairs.  When tile-N is a
         # multiple of 128, every subtile run starts on that boundary; the
@@ -225,6 +224,8 @@ class BlockScaleFactorLoad(EpiOp):
             base = group * reuse
             coord = coords[base]
             row = m_base + coord[0]
+            if const_expr(gemm.cluster_shape_mnk[0] > 1):
+                row = cutlass.min(row, limit_m - 1)
             pair_col = n_base + coord[1]
             scale = scale_mn[row, pair_col * 2].to(Float32)
             for j in cutlass.range(reuse, unroll_full=True):

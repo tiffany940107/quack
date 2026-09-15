@@ -33,7 +33,10 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--rows-per-expert", type=int, default=256)
     parser.add_argument("--n", type=int, default=2048, help="DGated pair count")
     parser.add_argument("--k", type=int, default=2048, help="GEMM reduction width")
+    parser.add_argument("--mainloop", choices=("bf16", "mxfp8"), default="mxfp8")
+    parser.add_argument("--tile-m", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=256)
+    parser.add_argument("--cluster-m", type=int, default=1)
     parser.add_argument("--cluster-n", type=int, default=1)
     parser.add_argument("--backlog", type=int, default=20)
     parser.add_argument("--rounds", type=int, default=3)
@@ -52,18 +55,37 @@ def main() -> None:
     if torch.cuda.get_device_properties(0).major != 10:
         raise RuntimeError("this benchmark requires an SM100 GPU")
     seqlens = [args.rows_per_expert] * args.experts
-    operands = create_blockscaled_varlen_m_operands(
-        args.experts,
-        0,
-        args.n,
-        args.k,
-        32,
-        cutlass.Float8E4M3FN,
-        cutlass.Float8E8M0FNU,
-        seqlens_m=seqlens,
-    )
-    _, _, qa, qb, sfa, sfb, offsets = operands
     total_m = sum(seqlens)
+    if args.mainloop == "mxfp8":
+        operands = create_blockscaled_varlen_m_operands(
+            args.experts,
+            0,
+            args.n,
+            args.k,
+            32,
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E8M0FNU,
+            seqlens_m=seqlens,
+        )
+        _, _, a, qb, sfa, sfb, offsets = operands
+        weight = qb.permute(2, 0, 1)
+    else:
+        offsets = torch.arange(
+            0,
+            total_m + 1,
+            args.rows_per_expert,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        a = torch.randn(total_m, args.k, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(
+            args.experts,
+            args.k,
+            args.n,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        sfa = sfb = None
     preact_bf16 = (
         torch.randn(total_m, 2 * args.n, device="cuda", dtype=torch.bfloat16) * 0.1
     )
@@ -74,27 +96,29 @@ def main() -> None:
         total_m, args.n, device="cuda", dtype=torch.bfloat16
     )
     postact_fp8c = torch.empty_like(postact_bf16)
-    weight = qb.permute(2, 0, 1)
     common = {
-        "tile_M": 128,
+        "tile_M": args.tile_m,
         "tile_N": args.tile_n,
-        "cluster_M": 1,
+        "cluster_M": args.cluster_m,
         "cluster_N": args.cluster_n,
         "pingpong": False,
         "persistent": True,
         "is_dynamic_persistent": False,
         "cu_seqlens_m": offsets,
-        "SFA": sfa,
-        "SFB": sfb,
-        "bs_format_a": "mxfp8_e4m3",
-        "bs_format_b": "mxfp8_e4m3",
     }
+    if args.mainloop == "mxfp8":
+        common.update(
+            SFA=sfa,
+            SFB=sfb,
+            bs_format_a="mxfp8_e4m3",
+            bs_format_b="mxfp8_e4m3",
+        )
     bf16_mod = dgated_mod("swiglu", has_scale=False, has_reduce=False)
     fp8c_mod = dgated_fp8_preact_mod("swiglu", has_scale=False, has_reduce=False)
 
     def launch_bf16() -> None:
         bf16_mod.gemm(
-            qa,
+            a,
             weight,
             dpreact_bf16,
             preact_bf16,
@@ -104,7 +128,7 @@ def main() -> None:
 
     def launch_fp8c() -> None:
         fp8c_mod.gemm(
-            qa,
+            a,
             weight,
             dpreact_fp8c,
             preact_mx.qdata,
@@ -137,8 +161,11 @@ def main() -> None:
                     "rows_per_expert": args.rows_per_expert,
                     "n": args.n,
                     "k": args.k,
+                    "tile_m": args.tile_m,
                     "tile_n": args.tile_n,
+                    "cluster_m": args.cluster_m,
                     "cluster_n": args.cluster_n,
+                    "mainloop": args.mainloop,
                 },
                 "backlog": args.backlog,
                 "samples_us": samples,

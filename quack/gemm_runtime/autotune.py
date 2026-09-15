@@ -88,9 +88,6 @@ def _config_space(mod, device):
         and not (c.swap_ab and (mod.mode != "element" or mod.sinks))
         and not c.use_tma_gather  # gather_A untested through the fn frontend
         and (c.split_k is None or c.split_k == 1)  # split-K is default-epilogue-only
-        # BlockScaleFactorLoad predicates varlen rows for one CTA only. Keep
-        # unsupported clustered-M candidates out of sink sizing and tuning.
-        and not (mod.mode == "packed_d_b16x2_c_fp8x2" and c.cluster_m != 1)
     ]
     if not cfgs:
         raise ValueError(f"no GemmConfigs for device capacity {cap}")

@@ -353,7 +353,10 @@ def test_blockscaled_gemm_varlen_m_gated_quantizes_preact_and_postact():
 
 @pytest.mark.parametrize("tile_n", [64, 128, 192, 256])
 @pytest.mark.parametrize("cluster_n", [1, 2])
-def test_blockscaled_varlen_dgated_loads_fp8_preact_with_tma(tile_n, cluster_n):
+@pytest.mark.parametrize("tile_m,cluster_m", [(128, 1), (128, 2), (256, 2)])
+def test_blockscaled_varlen_dgated_loads_fp8_preact_with_tma(
+    tile_n, cluster_n, tile_m, cluster_m
+):
     """DGated consumes the forward's blocked-scale E4M3 preactivation directly."""
     _skip_if_not_sm100()
     import cutlass
@@ -386,9 +389,9 @@ def test_blockscaled_varlen_dgated_loads_fp8_preact_with_tma(tile_n, cluster_n):
         dpreact,
         preact.qdata,
         epi_args={"preact_scale": preact.scale, "mAuxOut": postact},
-        tile_M=128,
+        tile_M=tile_m,
         tile_N=tile_n,
-        cluster_M=1,
+        cluster_M=cluster_m,
         cluster_N=cluster_n,
         pingpong=False,
         persistent=True,
