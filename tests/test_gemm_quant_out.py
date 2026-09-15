@@ -709,6 +709,67 @@ def test_quant_postact_gated_store_preact_exact():
     torch.testing.assert_close(postact[0].float(), q_ref, rtol=0, atol=0)
 
 
+def test_quant_gated_preact_and_postact_exact():
+    """FC1 can save preactivation and feed FC2 without a BF16 output."""
+    skip_unsupported(aux=True)
+    from quack.epilogue.library import gated_preact_postact_quant_mod
+
+    torch.manual_seed(0)
+    l, m, n, k = 1, 256, 512, 128
+    n_post = n // 2
+    a = torch.randn(l, m, k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(l, n, k, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(l, n, dtype=torch.bfloat16, device="cuda")
+    preact = torch.empty(l, m, n, dtype=torch.float8_e4m3fn, device="cuda")
+    postact = torch.empty(l, m, n_post, dtype=torch.float8_e4m3fn, device="cuda")
+    preact_sf = torch.empty(
+        l,
+        ceil_div(m, 128),
+        ceil_div(n, 128),
+        32,
+        4,
+        4,
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    postact_sf = torch.empty(
+        l,
+        ceil_div(m, 128),
+        ceil_div(n_post, 128),
+        32,
+        4,
+        4,
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    gated_preact_postact_quant_mod("reglu", has_rowvec=True).gemm(
+        a,
+        b,
+        preact,
+        epi_args={
+            "preact_sf": preact_sf,
+            "postact": postact,
+            "postact_sf": postact_sf,
+            "mRowVecBroadcast": bias,
+        },
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+    )
+
+    preact_ref = torch.einsum("lmk,lnk->lmn", a.float(), b.float()) + bias.float()[:, None]
+    postact_ref = preact_ref[..., 0::2].relu() * preact_ref[..., 1::2]
+    preact_q_ref, preact_sf_ref, _ = quant_ref(preact_ref[0], "mxfp8_e4m3")
+    postact_q_ref, postact_sf_ref, _ = quant_ref(postact_ref[0], "mxfp8_e4m3")
+    preact_sf_2d = unpack_scale_blocked_to_2d(preact_sf, m, n // 32)[0]
+    postact_sf_2d = unpack_scale_blocked_to_2d(postact_sf, m, n_post // 32)[0]
+    assert torch.equal(preact_sf_2d.view(torch.uint8), preact_sf_ref)
+    assert torch.equal(postact_sf_2d.view(torch.uint8), postact_sf_ref)
+    torch.testing.assert_close(preact[0].float(), preact_q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(postact[0].float(), postact_q_ref, rtol=0, atol=0)
+
+
 def test_quant_postact_nvfp4_norm_const():
     """nvfp4 postact with the per-tensor second level folded via sfd_norm_const."""
     skip_unsupported("nvfp4", aux=True)

@@ -113,6 +113,10 @@ class GemmBase:
     # contiguous N dim; "m": along the contiguous M dim (the AB-swapped-caller
     # layout). Replaces the per-call torch .view(float32) host views.
     cd_packed = None
+    # packed dgated variant whose public C is ``(..., 2N)`` E4M3 rather than
+    # 16-bit lanes. It is trace-recast to ``(..., N)`` Int16 for the TMA C
+    # path while D still uses the ordinary packed 16-bit -> f32 recast.
+    c_packed_fp8 = False
 
     def _recast_packed_cd(self, mT):
         """Trace-time f32 view of a kernel-order 16-bit packed tensor: halve
@@ -192,7 +196,11 @@ class GemmBase:
             if const_expr(mD is not None):
                 mD = self._recast_packed_cd(mD)
             if const_expr(mC is not None):
-                mC = self._recast_packed_cd(mC)
+                mC = (
+                    self._recast_packed_fp8x2(mC)
+                    if const_expr(self.c_packed_fp8)
+                    else self._recast_packed_cd(mC)
+                )
         return mA, mB, mD, mC, self.permute_batch_last_epi_args(epilogue_args, append_batch_if_2d)
 
     def permute_batch_last(

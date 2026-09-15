@@ -41,7 +41,10 @@ class _EpiModMixinBase(ComposableEpiMixin):
         if self._epi_mod_packed_cd:
             assert self.implicit_dtype.width == 16, "packed_cd lanes must be 16-bit"
             assert self.d_dtype.width == 32, "packed_cd D storage must be 32-bit (f32 view)"
-            assert self.c_dtype.width == 32, "packed_cd C storage must be 32-bit (f32 view)"
+            if getattr(self, "c_packed_fp8", False):
+                assert self.c_dtype is cutlass.Int16, "packed FP8 C storage must be Int16"
+            else:
+                assert self.c_dtype.width == 32, "packed_cd C storage must be 32-bit (f32 view)"
         # Aux-output constraints (gated 16-bit n-major, SM90 tile_N % 32) are
         # asserted by each TileStore op in to_params; the store path itself is
         # the generic ComposableEpiMixin/TileStore one.
@@ -160,7 +163,14 @@ class _EpiModMixinBase(ComposableEpiMixin):
         for name, kind in self._epi_mod_operands:
             if const_expr(kind == "apply"):
                 # Apply-port op: per-subtile port state; the fn gets a callable.
-                frags[name] = ops_by_name[name].fn_prepare(self, epi_loop_tensors[name], paired)
+                op = ops_by_name[name]
+                frags[name] = (
+                    epi_loop_tensors[name]
+                    if const_expr(
+                        self._epi_mod_packed_cd and hasattr(op, "fn_prepare_packed_c")
+                    )
+                    else op.fn_prepare(self, epi_loop_tensors[name], paired)
+                )
             elif const_expr(kind == "c"):
                 assert tRS_rC is not None, f"epilogue operand '{name}' requires the C operand"
                 if const_expr(mixed_lanes_ok and tRS_rC.element_type.width == 16):
@@ -189,11 +199,15 @@ class _EpiModMixinBase(ComposableEpiMixin):
             # GemmDGatedMixin: recast C -> widen to f32 -> pair views; scalar
             # calls with vectorize on SM100; pack (dx, dy) back into tRS_rD.
             implicit = self.implicit_dtype
-            xy16 = cute.recast_tensor(tRS_rC, implicit)
-            xy = xy16.to(Float32)
+            if const_expr(getattr(self, "c_packed_fp8", False)):
+                xy_lanes = cute.recast_tensor(tRS_rC, cutlass.Float8E4M3FN)
+            else:
+                xy_lanes = cute.recast_tensor(tRS_rC, implicit)
+            xy = xy_lanes.to(Float32)
             xy_pair = cute.flat_divide(xy, cute.make_layout(2))
             xv, yv = xy_pair[0, ...], xy_pair[1, ...]
-            dxy = cute.make_rmem_tensor(xy16.layout, Float32)
+            d_lanes_layout = cute.recast_tensor(tRS_rD, implicit).layout
+            dxy = cute.make_rmem_tensor(d_lanes_layout, Float32)
             dxy_pair = cute.flat_divide(dxy, cute.make_layout(2))
             dxv, dyv = dxy_pair[0, ...], dxy_pair[1, ...]
             n_el = cute.size(tRS_rD)
@@ -210,7 +224,12 @@ class _EpiModMixinBase(ComposableEpiMixin):
                 if const_expr(kind in ("row", "col")):
                     views[name] = _dense1(frags[name])
                 elif const_expr(kind != "c"):
-                    views[name] = frags[name]  # scalar / dense tile frag / apply pstate
+                    op = ops_by_name[name]
+                    views[name] = (
+                        op.fn_prepare_packed_c(self, frags[name], xy)
+                        if const_expr(kind == "apply" and hasattr(op, "fn_prepare_packed_c"))
+                        else frags[name]
+                    )
             # Ordinary packed_cd auxiliary outputs are one scalar per
             # accumulator pair (postact). A packed TileStore is different:
             # it exposes the full interleaved (dx, dy) stream, so retain the
@@ -219,7 +238,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
             outs = tuple(
                 cute.make_rmem_tensor(
                     (
-                        xy16.layout
+                        d_lanes_layout
                         if getattr(ops_by_name[name], "packed_dtype", None) is not None
                         else tRS_rD.layout.shape
                     ),

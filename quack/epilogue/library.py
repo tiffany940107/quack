@@ -53,7 +53,7 @@ from quack.epilogue.ops import (
     TileStore,
 )
 from quack.epilogue.head_rmsnorm import HeadRstd
-from quack.epilogue.quantize_out import BlockScaleFactorStore
+from quack.epilogue.quantize_out import BlockScaleFactorLoad, BlockScaleFactorStore
 from quack.epilogue.rotary import rotary_cos_sin_load
 from quack.epilogue.math import pack, pexp, unpack
 from quack.epilogue.frontend import gemm_epilogue
@@ -291,6 +291,50 @@ def gated_preact_quant_mod(activation, *, has_rowvec=False):
 
 
 swiglu_preact_quant_mod = gated_preact_quant_mod("swiglu")
+
+
+@functools.lru_cache(maxsize=None)
+def gated_preact_postact_quant_mod(activation, *, has_rowvec=False):
+    """Training FC1 with rowwise MX quantization for both saved values.
+
+    ``D`` is the full-width quantized preactivation (gate/up interleaved),
+    while ``postact`` is the half-width quantized gated activation.  Their
+    independent scale stores share the accumulator visit but retain the
+    canonical blocked layouts expected by downstream blockscaled GEMMs.
+    """
+    act = gate_fn_map[activation]
+    outputs = (
+        TileStore(
+            "postact",
+            gated=True,
+            quant=BlockScaleFactorStore("postact_sf", output="postact"),
+        ),
+    )
+    preact_quant = (BlockScaleFactorStore("preact_sf"),)
+    if has_rowvec:
+
+        @gemm_epilogue(
+            outputs=outputs,
+            ops={"mRowVecBroadcast": RowVecLoad("mRowVecBroadcast")},
+            extra_ops=preact_quant,
+            mode="acc_pair",
+        )
+        def gated_preact_postact_quant_epi(acc, mRowVecBroadcast):
+            value = acc + mRowVecBroadcast
+            gate, up = unpack(value)
+            return {"D": pack(gate, up), "postact": act(gate, up)}
+
+    else:
+
+        @gemm_epilogue(outputs=outputs, extra_ops=preact_quant, mode="acc_pair")
+        def gated_preact_postact_quant_epi(acc):
+            gate, up = unpack(acc)
+            return {"D": pack(gate, up), "postact": act(gate, up)}
+
+    return gated_preact_postact_quant_epi
+
+
+swiglu_preact_postact_quant_mod = gated_preact_postact_quant_mod("swiglu")
 
 
 @gemm_epilogue(outputs=("postact",), mode="acc_pair")
@@ -789,6 +833,85 @@ def dgated_dquant_mod(activation, *, has_scale, has_reduce):
         if has_reduce
         else None,
         mode="packed_cd_b16x2",
+    )(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def dgated_fp8_preact_mod(activation, *, has_scale, has_reduce):
+    """DGated GEMM whose packed C input is rowwise MXFP8 preactivation.
+
+    C is supplied publicly as ``(M, 2N)`` E4M3 and TMA-loaded physically as
+    ``(M, N)`` Int16.  ``preact_scale(c)`` applies the canonical blocked
+    E8M0 scale in registers before gated backward math.
+    """
+    dgate = dgate_fn_map[activation]
+    params, body = ["c", "preact_scale"], []
+    if has_scale:
+        params.append("mColVecBroadcast")
+    body.append("x, y = unpack(preact_scale(c))")
+    dout = "acc * mColVecBroadcast" if has_scale else "acc"
+    body.append(f"dx, dy, out = dgate(x, y, {dout})")
+    postact = "out * mColVecBroadcast" if has_scale else "out"
+    if has_reduce:
+        body.append(
+            f'return {{"D": pack(dx, dy), "mAuxOut": {postact}, '
+            '"mColVecReduce": (out, acc)}}'
+        )
+    else:
+        body.append(f'return {{"D": pack(dx, dy), "mAuxOut": {postact}}}')
+    tag = f"dgated_fp8_preact:{activation}:s{int(has_scale)}r{int(has_reduce)}"
+    fn = _gen_epi_fn("dgated_fp8_preact_epi", tag, params, body, {"dgate": dgate})
+    ops = _vec_pins(params)
+    ops["preact_scale"] = BlockScaleFactorLoad("preact_scale")
+    return gemm_epilogue(
+        outputs=("mAuxOut",),
+        ops=ops,
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
+        if has_reduce
+        else None,
+        mode="packed_d_b16x2_c_fp8x2",
+    )(fn)
+
+
+@functools.lru_cache(maxsize=None)
+def dgated_fp8_preact_dquant_mod(activation, *, has_scale, has_reduce):
+    """FP8-preactivation DGated plus a fused MXFP8 dpreact consumer view."""
+    dgate = dgate_fn_map[activation]
+    params, body = ["c", "preact_scale"], []
+    if has_scale:
+        params.append("mColVecBroadcast")
+    body.append("x, y = unpack(preact_scale(c))")
+    dout = "acc * mColVecBroadcast" if has_scale else "acc"
+    body.append(f"dx, dy, out = dgate(x, y, {dout})")
+    postact = "out * mColVecBroadcast" if has_scale else "out"
+    dpreact = "pack(dx, dy)"
+    if has_reduce:
+        body.append(
+            f'return {{"D": {dpreact}, "mDQuant": {dpreact}, '
+            f'"mAuxOut": {postact}, "mColVecReduce": (out, acc)}}'
+        )
+    else:
+        body.append(
+            f'return {{"D": {dpreact}, "mDQuant": {dpreact}, "mAuxOut": {postact}}}'
+        )
+    tag = f"dgated_fp8_preact_dquant:{activation}:s{int(has_scale)}r{int(has_reduce)}"
+    fn = _gen_epi_fn("dgated_fp8_preact_dquant_epi", tag, params, body, {"dgate": dgate})
+    ops = _vec_pins(params)
+    ops["preact_scale"] = BlockScaleFactorLoad("preact_scale")
+    return gemm_epilogue(
+        outputs=(
+            "mAuxOut",
+            TileStore(
+                "mDQuant",
+                quant=BlockScaleFactorStore("mDQuant_sf", output="mDQuant", pack_factor=2),
+                packed_dtype=Float8E4M3FN,
+            ),
+        ),
+        ops=ops,
+        reduces={"mColVecReduce": ColVecReduce("mColVecReduce", scaled=True)}
+        if has_reduce
+        else None,
+        mode="packed_d_b16x2_c_fp8x2",
     )(fn)
 
 

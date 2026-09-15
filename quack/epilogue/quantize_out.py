@@ -132,6 +132,111 @@ class _SfdColLoopState(NamedTuple):
     norm_const: Optional[Float32]
 
 
+class BlockScaleFactorLoad(EpiOp):
+    """Apply-port loader for a rowwise E8M0 scale tensor.
+
+    The owning epilogue's C operand contains two adjacent E4M3 values per
+    GEMM column.  This op exposes ``scale(c)`` to the epilogue function and
+    multiplies both lanes by the matching 1x32 dequantization scale.  Scale
+    storage stays in Quack's canonical blocked ``(L, rm, rk, 32, 4, 4)``
+    layout; only a trace-time logical view is created.
+
+    The first implementation intentionally requires ``cluster_M=1``.  That
+    keeps every manual scale load within the expert's 128-row padded region;
+    a future clustered variant must predicate phantom partner-CTA rows.
+    """
+
+    fn_port = "apply"
+
+    def host_fake_arg(self, key, fctx):
+        dtype, ndim = key
+        assert ndim == 6, f"scale-factor load expects a 6-D blocked tensor, got {ndim}"
+        return make_fake_sf_tensor(dtype, 1 if fctx.varlen_m else fctx.l)
+
+    def host_validate(self, value, *, m, n, batch, varlen_m, **kwargs):
+        import torch
+
+        if value.dtype != torch.float8_e8m0fnu:
+            raise TypeError("preactivation scales must have dtype float8_e8m0fnu")
+        leading = 1 if varlen_m or batch is None else batch
+        rows = (m + 127) // 128 + ((batch or 1) - 1 if varlen_m else 0)
+        cols = (2 * n + 127) // 128
+        expected = (leading, rows, cols, 32, 4, 4)
+        if tuple(value.shape) != expected:
+            raise ValueError(f"preactivation scales must have shape {expected}, got {value.shape}")
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        scale = getattr(args, self.name)
+        assert scale.element_type is cutlass.Float8E8M0FNU
+        assert gemm.cluster_shape_mnk[0] == 1, (
+            "FP8 preactivation scale loads currently require cluster_M=1"
+        )
+        vec = 32
+        m_pad = scale.shape[1] * 128
+        n_pad = scale.shape[2] * 4 * vec
+        logical_shape = (m_pad, n_pad) if gemm.varlen_m else (m_pad, n_pad, scale.shape[0])
+        logical_layout = layout_utils.tile_atom_to_shape_SF_strided(
+            logical_shape, vec, scale.stride
+        )
+        return {self.name: cute.make_tensor(scale.iterator, logical_layout)}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(ctx.varlen_manager.varlen_m):
+            scale_mn = ctx.varlen_manager.offset_batch_SFA(param, ctx.batch_idx)
+        else:
+            scale_mn = param[None, None, ctx.batch_idx]
+        coords = ctx.partition_for_epilogue_fn(
+            cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+        )
+        m_base = ctx.tile_coord_mnkl[0] * ctx.tile_M
+        n_base = ctx.tile_coord_mnkl[1] * ctx.tile_N
+        return scale_mn, coords, m_base, n_base
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        scale_mn, coords, m_base, n_base = state
+        coords_cur = cute.group_modes(coords, 3, cute.rank(coords))[
+            None, None, None, epi_coord
+        ]
+        return scale_mn, coords_cur, m_base, n_base
+
+    @cute.jit
+    def fn_prepare_packed_c(self, gemm, state, values):
+        """Dequantize the packed C fragment before the vectorized visit loop.
+
+        Keeping one scale per accumulator slot live across the dgate loop adds
+        a full register fragment and can push this already-heavy epilogue over
+        the occupancy cliff.  Apply each scale directly to its two FP8 lanes
+        instead, matching the lifetime of the hand-written DGated path.
+        """
+        scale_mn, coords, m_base, n_base = state
+        # SM100's packed-D epilogue gives each thread contiguous runs of pair
+        # columns on one row.  One scale covers 16 pairs.  When tile-N is a
+        # multiple of 128, every subtile run starts on that boundary; the
+        # 192-wide configs instead start alternate runs eight pairs into a
+        # group, so use the smaller universally safe reuse there.
+        reuse = 16 if gemm.cta_tile_shape_mnk[1] % 128 == 0 else 8
+        assert cute.size(coords) % reuse == 0
+        for group in cutlass.range(cute.size(coords) // reuse, unroll_full=True):
+            base = group * reuse
+            coord = coords[base]
+            row = m_base + coord[0]
+            pair_col = n_base + coord[1]
+            scale = scale_mn[row, pair_col * 2].to(Float32)
+            for j in cutlass.range(reuse, unroll_full=True):
+                i = base + j
+                values[2 * i] = values[2 * i] * scale
+                values[2 * i + 1] = values[2 * i + 1] * scale
+
+    @cute.jit
+    def fn_apply(self, gemm, pstate, i, value):
+        return value
+
+
 class BlockScaleFactorStore(EpiOp):
     """Output-quantization scale factors (SFD) for mxfp8 / mxfp4 / nvfp4 D.
 

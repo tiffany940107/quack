@@ -158,6 +158,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import sys
+from dataclasses import replace
 from typing import NamedTuple, Optional
 
 
@@ -203,7 +204,23 @@ from quack.rounding import RoundingMode
 
 _SM_BASE = {8: GemmSm80, 9: GemmSm90, 10: GemmSm100, 11: GemmSm100, 12: GemmSm120}
 
-_EPI_MODES = {"element", "acc_pair", "packed_cd_b16x2"}
+_EPI_MODES = {
+    "element",
+    "acc_pair",
+    "packed_cd_b16x2",
+    "packed_d_b16x2_c_fp8x2",
+}
+
+
+def _blockscaled_default_for_mode(mode, m, n, device):
+    cap = get_device_capacity(device)[0]
+    config = blockscaled_default_config(m, n, device_capacity=cap)
+    if mode == "packed_d_b16x2_c_fp8x2" and cap in (10, 11):
+        # The manual varlen scale load is safe only within one 128-row CTA.
+        # Tile-N 128 is also the best no-tune choice for the target DGated
+        # training shape; callers can still pass a measured explicit config.
+        config = replace(config, tile_m=128, tile_n=128, cluster_m=1)
+    return config
 
 
 _KIND_TO_OP = {
@@ -347,9 +364,12 @@ class EpiMod:
         if self.mode not in _EPI_MODES:
             raise ValueError(f"unsupported epilogue mode {self.mode!r}; choose one of {_EPI_MODES}")
         packed_outputs = [op.name for op in self.output_ops.values() if op.packed_dtype is not None]
-        if packed_outputs and self.mode != "packed_cd_b16x2":
+        if packed_outputs and self.mode not in (
+            "packed_cd_b16x2",
+            "packed_d_b16x2_c_fp8x2",
+        ):
             raise ValueError(
-                f"packed TileStore outputs {packed_outputs} require mode='packed_cd_b16x2'"
+                f"packed TileStore outputs {packed_outputs} require a packed-D epilogue mode"
             )
         self.paired = ("acc",) if self.mode == "acc_pair" else ()
         # None = vectorize the fn loop where supported (SM100). False = keep
@@ -815,7 +835,8 @@ class EpiMod:
         # trace transposes); operand-kind inference and vec shape checks use
         # kernel coords.
         paired_acc = self.mode == "acc_pair"
-        packed_c = self.mode == "packed_cd_b16x2"
+        packed_c = self.mode in ("packed_cd_b16x2", "packed_d_b16x2_c_fp8x2")
+        c_packed_fp8 = self.mode == "packed_d_b16x2_c_fp8x2"
         if paired_acc and (n_gemm % 2 or tile_N % 2):
             raise ValueError("acc_pair mode requires even GEMM N and tile_N")
         post_init_attrs = tuple(post_init_attrs)
@@ -833,11 +854,27 @@ class EpiMod:
                 raise ValueError("packed_cd_b16x2 mode requires a 'c' fn parameter")
             if C is None or D is None:
                 raise ValueError("packed_cd_b16x2 mode requires both C and D")
-            if D.dtype != C.dtype or D.shape != C.shape:
-                raise ValueError("packed C requires a matching D of the same dtype and shape")
-            if C.dtype not in (torch.float16, torch.bfloat16):
-                raise TypeError("C must be float16 or bfloat16 in packed_cd_b16x2 mode")
-            post_init_attrs = (*post_init_attrs, ("implicit_dtype", torch2cute_dtype_map[C.dtype]))
+            if D.shape != C.shape:
+                raise ValueError("packed C requires a matching D shape")
+            if c_packed_fp8:
+                if C.dtype != torch.float8_e4m3fn:
+                    raise TypeError("packed FP8 C must be float8_e4m3fn")
+                if D.dtype not in (torch.float16, torch.bfloat16):
+                    raise TypeError("packed FP8 C mode requires a float16 or bfloat16 D")
+                post_init_attrs = (
+                    *post_init_attrs,
+                    ("implicit_dtype", torch2cute_dtype_map[D.dtype]),
+                    ("c_packed_fp8", True),
+                )
+            else:
+                if D.dtype != C.dtype:
+                    raise ValueError("packed C requires D with the same dtype")
+                if C.dtype not in (torch.float16, torch.bfloat16):
+                    raise TypeError("C must be float16 or bfloat16 in packed_cd_b16x2 mode")
+                post_init_attrs = (
+                    *post_init_attrs,
+                    ("implicit_dtype", torch2cute_dtype_map[C.dtype]),
+                )
         n = n_gemm
         if varlen_m:
             # total_m for operand inference (colvec length); A rows differ
@@ -854,7 +891,19 @@ class EpiMod:
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         if packed_c:
-            if C.stride(-1) == 1 or varlen_m:
+            if c_packed_fp8:
+                if C.stride(-1) != 1 or D.stride(-1) != 1:
+                    raise ValueError("packed FP8 C and packed D must be contiguous along N")
+                packed_shape = _tile_shape(batch, m, 2 * n_gemm, varlen_m)
+                _require_shape("C", C, packed_shape)
+                _require_shape("D", D, packed_shape)
+                if C.storage_offset() % 2 or any(s % 2 for s in C.stride()[:-1]):
+                    raise ValueError(
+                        "packed FP8 C storage offset and outer strides must permit an Int16 view"
+                    )
+                _validate_packed_tensor("D", D)
+                packed_form = "n"
+            elif C.stride(-1) == 1 or varlen_m:
                 packed_shape = _tile_shape(batch, m, 2 * n_gemm, varlen_m)
                 _require_shape("C", C, packed_shape)
                 _require_shape("D", D, packed_shape)
@@ -1620,9 +1669,7 @@ class EpiMod:
             if config is not None:
                 cfg = config
             elif SFA is not None:
-                cfg = blockscaled_default_config(
-                    A.shape[-2], n, device_capacity=get_device_capacity(A.device)[0]
-                )
+                cfg = _blockscaled_default_for_mode(self.mode, A.shape[-2], n, A.device)
             else:
                 cfg = self._default_config(A, B, transform_a)
             if needs_transform_operands:
@@ -1693,20 +1740,25 @@ class EpiMod:
             from quack.operand_transform.host import as_transform_mod
 
             transform_a = as_transform_mod(transform_a)
-        cfg = config if config is not None else self._default_config(A, B, transform_a)
+        n = B.shape[-1]
+        A_bundle = None
+        if transform_a is not None and transform_a.owned_fmt is not None:
+            B_d = B  # the blob crosses kernel-native
+            n = transform_a.padded_n(B)
+        if config is not None:
+            cfg = config
+        elif SFA is not None:
+            cfg = _blockscaled_default_for_mode(self.mode, A.shape[-2], n, A.device)
+        else:
+            cfg = self._default_config(A, B, transform_a)
         dyn = dynamic_scheduler or cfg.is_dynamic_persistent
         out = dict(out)
         D = out.get("D")
         for name in self.outputs:
             if out.get(name) is None:
                 raise ValueError(f"plan() requires a buffer for output {name!r}")
-        n = B.shape[-1]
-        A_bundle = None
         if transform_a is not None:
-            if transform_a.owned_fmt is not None:
-                B_d = B  # the blob crosses kernel-native
-                n = transform_a.padded_n(B)
-            elif transform_a.needs_operands:
+            if transform_a.needs_operands:
                 if not transform_operands:
                     raise ValueError(
                         f"transform_a {transform_a.name!r} declares "

@@ -268,6 +268,241 @@ def test_blockscaled_gemm_varlen_m_gated_quant_store_preact():
     assert ((dequant - postact_ref).abs() <= bound).all()
 
 
+def test_blockscaled_gemm_varlen_m_gated_quantizes_preact_and_postact():
+    """Grouped FC1 emits only MXFP8 tensors for its saved and consumed values."""
+    _skip_if_not_sm100()
+    import cutlass
+
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from quack.epilogue.library import gated_preact_postact_quant_mod
+
+    seqlens_m = [1, 128, 127, 129]
+    num_experts = len(seqlens_m)
+    n, k = 512, 256
+    intermediate = n // 2
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts,
+        0,
+        n,
+        k,
+        32,
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        seqlens_m=seqlens_m,
+    )
+    total_m = sum(seqlens_m)
+    padded_rm = (total_m + 127) // 128 + num_experts - 1
+    preact = torch.empty(total_m, n, dtype=torch.float8_e4m3fn, device="cuda")
+    postact = torch.empty(total_m, intermediate, dtype=torch.float8_e4m3fn, device="cuda")
+    preact_sf = torch.empty(
+        (1, padded_rm, (n + 127) // 128, 32, 4, 4),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    postact_sf = torch.empty(
+        (1, padded_rm, (intermediate + 127) // 128, 32, 4, 4),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    gated_preact_postact_quant_mod("swiglu").gemm(
+        qa,
+        qb.permute(2, 0, 1),
+        preact,
+        epi_args={
+            "preact_sf": preact_sf,
+            "postact": postact,
+            "postact_sf": postact_sf,
+        },
+        tile_M=128,
+        tile_N=256,
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=True,
+        persistent=True,
+        is_dynamic_persistent=True,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+
+    cu = cu_seqlens_m.tolist()
+    preact_ref = torch.cat([a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)])
+    postact_ref = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
+
+    def dequant_varlen(value, scale_tensor):
+        sf_k = value.shape[-1] // 32
+        padded = unpack_scale_blocked_to_2d(scale_tensor, padded_rm * 128, sf_k)[0]
+        active = torch.cat(
+            [
+                padded[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
+                for i in range(num_experts)
+            ]
+        ).float()
+        scale = active.repeat_interleave(32, dim=-1)
+        return value.float() * scale, scale
+
+    preact_dequant, preact_scale = dequant_varlen(preact, preact_sf)
+    postact_dequant, postact_scale = dequant_varlen(postact, postact_sf)
+    preact_bound = preact_scale * (16.0 * 1.05) + 1e-2
+    postact_bound = postact_scale * (16.0 * 1.05) + 1e-2
+    assert ((preact_dequant - preact_ref).abs() <= preact_bound).all()
+    assert ((postact_dequant - postact_ref).abs() <= postact_bound).all()
+
+
+@pytest.mark.parametrize("tile_n", [64, 128, 192, 256])
+@pytest.mark.parametrize("cluster_n", [1, 2])
+def test_blockscaled_varlen_dgated_loads_fp8_preact_with_tma(tile_n, cluster_n):
+    """DGated consumes the forward's blocked-scale E4M3 preactivation directly."""
+    _skip_if_not_sm100()
+    import cutlass
+
+    from quack.blockscaled import quantize_mxfp8_varlen_m
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from quack.epilogue.library import dgated_fp8_preact_mod
+
+    seqlens_m = [100, 156, 128]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts,
+        0,
+        n,
+        k,
+        32,
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        seqlens_m=seqlens_m,
+    )
+    total_m = sum(seqlens_m)
+    preact_hp = torch.randn(total_m, 2 * n, dtype=torch.bfloat16, device="cuda") * 0.1
+    preact = quantize_mxfp8_varlen_m(preact_hp, cu_seqlens_m)
+    dpreact = torch.empty_like(preact_hp)
+    postact = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    dgated_fp8_preact_mod("swiglu", has_scale=False, has_reduce=False).gemm(
+        qa,
+        qb.permute(2, 0, 1),
+        dpreact,
+        preact.qdata,
+        epi_args={"preact_scale": preact.scale, "mAuxOut": postact},
+        tile_M=128,
+        tile_N=tile_n,
+        cluster_M=1,
+        cluster_N=cluster_n,
+        pingpong=False,
+        persistent=True,
+        is_dynamic_persistent=False,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+    )
+
+    cu = cu_seqlens_m.tolist()
+    padded_rows = preact.scale.shape[1] * 128
+    padded_sf = unpack_scale_blocked_to_2d(preact.scale, padded_rows, (2 * n) // 32)[0]
+    active_sf = torch.cat(
+        [
+            padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
+            for i in range(num_experts)
+        ]
+    ).float()
+    preact_dq = preact.qdata.float() * active_sf.repeat_interleave(32, dim=-1)
+    dout = torch.cat([a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)])
+    preact_ref = preact_dq.detach().requires_grad_()
+    postact_ref = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
+    (dpreact_ref,) = torch.autograd.grad(postact_ref, preact_ref, dout)
+    assert _rel_err(dpreact, dpreact_ref) < 1e-2
+    assert _rel_err(postact, postact_ref) < 1e-2
+
+
+def test_blockscaled_varlen_dgated_fp8_preact_quantizes_dpreact():
+    """The full DGated epilogue consumes FP8 z and emits FP8 dpreact."""
+    _skip_if_not_sm100()
+    import cutlass
+
+    from quack.blockscaled import quantize_mxfp8_varlen_m
+    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from quack.epilogue.library import dgated_fp8_preact_dquant_mod
+
+    seqlens_m = [100, 156, 256]
+    num_experts = len(seqlens_m)
+    n, k = 256, 256
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
+        num_experts,
+        0,
+        n,
+        k,
+        32,
+        cutlass.Float8E4M3FN,
+        cutlass.Float8E8M0FNU,
+        seqlens_m=seqlens_m,
+    )
+    total_m = sum(seqlens_m)
+    padded_rm = (total_m + 127) // 128 + num_experts - 1
+    preact_hp = torch.randn(total_m, 2 * n, dtype=torch.bfloat16, device="cuda") * 0.1
+    preact = quantize_mxfp8_varlen_m(preact_hp, cu_seqlens_m)
+    score = torch.rand(total_m, dtype=torch.float32, device="cuda") + 0.5
+    dpreact = torch.empty_like(preact_hp)
+    dpreact_q = torch.empty_like(preact.qdata)
+    dpreact_sf = torch.empty(
+        (1, padded_rm, (2 * n) // 128, 32, 4, 4),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    postact = torch.empty(total_m, n, dtype=torch.bfloat16, device="cuda")
+    result = dgated_fp8_preact_dquant_mod("swiglu", has_scale=True, has_reduce=True)(
+        qa,
+        qb.permute(2, 1, 0),
+        preact.qdata,
+        out={"D": dpreact, "mDQuant": dpreact_q, "mAuxOut": postact},
+        tuned=False,
+        dynamic_scheduler=False,
+        cu_seqlens_m=cu_seqlens_m,
+        SFA=sfa,
+        SFB=sfb,
+        bs_format_a="mxfp8_e4m3",
+        bs_format_b="mxfp8_e4m3",
+        preact_scale=preact.scale,
+        mColVecBroadcast=score,
+        mDQuant_sf=dpreact_sf,
+    )
+
+    cu = cu_seqlens_m.tolist()
+    padded_rows = preact.scale.shape[1] * 128
+    padded_sf = unpack_scale_blocked_to_2d(preact.scale, padded_rows, (2 * n) // 32)[0]
+    active_sf = torch.cat(
+        [
+            padded_sf[(cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]]
+            for i in range(num_experts)
+        ]
+    ).float()
+    preact_dq = preact.qdata.float() * active_sf.repeat_interleave(32, dim=-1)
+    dout = torch.cat([a_ref[cu[i] : cu[i + 1]] @ b_ref[i].T for i in range(num_experts)])
+    preact_ref = preact_dq.detach().requires_grad_()
+    gated = F.silu(preact_ref[:, 0::2]) * preact_ref[:, 1::2]
+    (gated * score[:, None] * dout).sum().backward()
+    assert _rel_err(dpreact, preact_ref.grad) < 1e-2
+    assert _rel_err(postact, gated * score[:, None]) < 1e-2
+    assert _rel_err(result["mColVecReduce"], (gated * dout).sum(-1)) < 1e-3
+
+    padded_dsf = unpack_scale_blocked_to_2d(dpreact_sf, padded_rm * 128, (2 * n) // 32)[0]
+    active_dsf = torch.cat(
+        [
+            padded_dsf[
+                (cu[i] // 128 + i) * 128 : (cu[i] // 128 + i) * 128 + seqlens_m[i]
+            ]
+            for i in range(num_experts)
+        ]
+    ).float()
+    dscale = active_dsf.repeat_interleave(32, dim=-1)
+    dpreact_dq = dpreact_q.float() * dscale
+    bound = dscale * (16.0 * 1.05) + 1e-2
+    assert ((dpreact_dq - preact_ref.grad).abs() <= bound).all()
+
+
 def test_blockscaled_varlen_dgated_quantizes_dpreact():
     """FC2 dgrad emits BF16 dpreact and its MXFP8 consumer view together."""
     _skip_if_not_sm100()
