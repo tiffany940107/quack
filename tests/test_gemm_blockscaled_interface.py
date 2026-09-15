@@ -362,7 +362,7 @@ def test_blockscaled_varlen_dgated_loads_fp8_preact_with_tma(tile_n, cluster_n):
     from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
     from quack.epilogue.library import dgated_fp8_preact_mod
 
-    seqlens_m = [100, 156, 128]
+    seqlens_m = [0, 100, 0, 156, 128, 0]
     num_experts = len(seqlens_m)
     n, k = 256, 256
     a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_m = create_blockscaled_varlen_m_operands(
