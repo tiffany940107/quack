@@ -706,6 +706,50 @@ def test_blockscaled_gemm_varlen_k(seqlens_k):
     assert err < 5e-3, f"varlen_k seqlens_k={seqlens_k} max_err={err}"
 
 
+@pytest.mark.parametrize("seqlens_k", [[128, 128, 128], [100, 220, 65]])
+def test_blockscaled_gemm_varlen_k_fp32_accumulate(seqlens_k):
+    """TMA reduce-add accumulates ragged MXFP8 wgrad directly in FP32."""
+    _skip_if_not_sm100()
+    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
+
+    num_experts = len(seqlens_k)
+    m, n, sf_vec = 256, 256, 32
+    torch.manual_seed(0)
+    operands = create_blockscaled_varlen_k_operands(
+        num_experts, 0, m, n, sf_vec, seqlens_k=seqlens_k
+    )
+    a_ref, b_ref, qa, qb, sfa, sfb, cu_seqlens_k = operands
+    a_op = BlockScaledOperand.from_parts(qa, sfa, "mxfp8")
+    b_op = BlockScaledOperand.from_parts(qb.t(), sfb, "mxfp8", quant_dim=-2)
+    contribution = torch.stack(
+        [a_ref[i] @ b_ref[i].T for i in range(num_experts)]
+    )
+    initial = torch.randn(
+        num_experts, m, n, dtype=torch.float32, device="cuda"
+    )
+    accumulator = initial.clone()
+
+    gemm_add_inplace(
+        a_op,
+        b_op,
+        accumulator,
+        cu_seqlens_k=cu_seqlens_k,
+        tuned=False,
+    )
+    expected = initial + contribution
+    assert (accumulator - expected).abs().max() < 5e-3
+
+    gemm_add_inplace(
+        a_op,
+        b_op,
+        accumulator,
+        cu_seqlens_k=cu_seqlens_k,
+        tuned=False,
+    )
+    expected = initial + 2 * contribution
+    assert (accumulator - expected).abs().max() < 1e-2
+
+
 def test_blockscaled_varlen_k_iface_plan_replays_runtime_offsets():
     """Warm plans must consume each call's offsets rather than capturing values."""
     _skip_if_not_sm100()
